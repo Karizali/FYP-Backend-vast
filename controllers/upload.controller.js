@@ -13,14 +13,14 @@ function assignJobId(req, res, next) {
 
 // ─── Middleware: check plan limits before accepting the upload ─────────────────
 function checkPlanLimit(req, res, next) {
-  if (!req.user.canCreateJob()) {
-    return res.status(403).json({
-      success:       false,
-      message:       `Monthly job limit reached for your "${req.user.plan}" plan.`,
-      jobsRemaining: req.user.jobsRemaining,
-      plan:          req.user.plan,
-    });
-  }
+  // if (!req.user.canCreateJob()) {
+  //   return res.status(403).json({
+  //     success:       false,
+  //     message:       `Monthly job limit reached for your "${req.user.plan}" plan.`,
+  //     jobsRemaining: req.user.jobsRemaining,
+  //     plan:          req.user.plan,
+  //   });
+  // }
   next();
 }
 
