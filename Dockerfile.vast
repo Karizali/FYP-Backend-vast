@@ -1,0 +1,94 @@
+# ─── Vast.ai GPU Worker — 3D Gaussian Splatting ──────────────────────────────
+FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
+ENV FORCE_CUDA=1
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH="/usr/local/cuda/bin:${PATH}"
+
+# ─── System packages ──────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget curl ffmpeg colmap blender \
+    libgl1 libglib2.0-0 tzdata ninja-build \
+    python3 python3-pip python-is-python3 \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── Remove any pre-installed opencv that requires NumPy 2 ───────────────────
+RUN pip3 uninstall -y opencv-python opencv-contrib-python 2>/dev/null || true
+
+# ─── Pin numpy + install headless opencv ─────────────────────────────────────
+RUN pip3 install --no-cache-dir \
+    "numpy==1.26.4" \
+    "opencv-python-headless==4.8.1.78"
+
+# ─── Fake opencv-python dist-info to satisfy basicsr/facexlib/gfpgan ─────────
+RUN python3 - <<'PYEOF'
+import site, os
+OCV_VER = "4.8.1.78"
+dist_dir = os.path.join(site.getsitepackages()[0], f"opencv_python-{OCV_VER}.dist-info")
+os.makedirs(dist_dir, exist_ok=True)
+with open(os.path.join(dist_dir, "METADATA"), "w") as f:
+    f.write(f"Metadata-Version: 2.1\nName: opencv-python\nVersion: {OCV_VER}\n")
+with open(os.path.join(dist_dir, "RECORD"), "w") as f:
+    f.write("")
+with open(os.path.join(dist_dir, "INSTALLER"), "w") as f:
+    f.write("pip\n")
+print(f"Created shim at {dist_dir}")
+PYEOF
+
+# ─── PyTorch (CUDA 12.1) ─────────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir \
+    torch==2.1.0+cu121 \
+    torchvision==0.16.0+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# ─── Re-lock numpy after torch ───────────────────────────────────────────────
+RUN pip3 install --no-cache-dir --force-reinstall "numpy==1.26.4"
+
+# ─── Core packages ───────────────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir \
+    cloudinary==1.36.0 \
+    requests==2.31.0 \
+    python-dotenv==1.0.0 \
+    "Pillow==10.1.0" \
+    plyfile \
+    tqdm
+
+# ─── Real-ESRGAN ─────────────────────────────────────────────────────────────
+RUN git clone https://github.com/xinntao/Real-ESRGAN.git /Real-ESRGAN
+
+RUN pip3 install --no-cache-dir basicsr facexlib gfpgan && \
+    pip3 install --no-cache-dir -r /Real-ESRGAN/requirements.txt
+
+RUN pip3 install --no-cache-dir --force-reinstall \
+    "numpy==1.26.4" \
+    "opencv-python-headless==4.8.1.78"
+
+RUN pip3 install --no-cache-dir -e /Real-ESRGAN
+
+RUN wget -q -P /Real-ESRGAN/weights/ \
+      https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+
+# ─── Gaussian Splatting ───────────────────────────────────────────────────────
+RUN git clone --recurse-submodules --shallow-submodules \
+      https://github.com/graphdeco-inria/gaussian-splatting.git /gaussian-splatting && \
+    cd /gaussian-splatting && \
+    git submodule deinit SIBR_viewers || true
+
+RUN pip3 install --no-cache-dir --force-reinstall "numpy==1.26.4"
+
+RUN pip3 install --no-cache-dir \
+        /gaussian-splatting/submodules/diff-gaussian-rasterization && \
+    pip3 install --no-cache-dir \
+        /gaussian-splatting/submodules/simple-knn
+
+# ─── Final numpy lock ────────────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir --force-reinstall "numpy==1.26.4"
+
+# ─── Copy worker ─────────────────────────────────────────────────────────────
+COPY workers/vast_worker.py /vast_worker.py
+WORKDIR /workspace
+CMD ["python3", "-u", "/vast_worker.py"]
