@@ -12,9 +12,9 @@ function verifyWorkerSecret(req) {
 // ─── GET /api/jobs ────────────────────────────────────────────────────────────
 async function listJobs(req, res, next) {
   try {
-    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(50, parseInt(req.query.limit) || 10);
-    const skip  = (page - 1) * limit;
+    const skip = (page - 1) * limit;
 
     const filter = { userId: req.user._id, deletedAt: null };
     if (req.query.status) filter.status = req.query.status;
@@ -33,7 +33,7 @@ async function listJobs(req, res, next) {
       data: jobs.map((j) => j.toSummary()),
       pagination: {
         page, limit, total,
-        pages:   Math.ceil(total / limit),
+        pages: Math.ceil(total / limit),
         hasNext: page * limit < total,
       },
     });
@@ -59,7 +59,7 @@ async function getJobResult(req, res, next) {
       return res.status(400).json({
         success: false,
         message: `Job is not complete yet. Current status: "${job.status}".`,
-        status:  job.status, progressPct: job.progressPct,
+        status: job.status, progressPct: job.progressPct,
       });
     }
 
@@ -77,14 +77,14 @@ async function getJobResult(req, res, next) {
     res.json({
       success: true,
       data: {
-        jobId:           job._id,
-        title:           job.title,
+        jobId: job._id,
+        title: job.title,
         glbUrl,
         thumbnailUrl,
-        glbExpiresAt:    new Date(Date.now() + 86400 * 1000).toISOString(),
-        fileSizeBytes:   job.output.fileSizeBytes,
+        glbExpiresAt: new Date(Date.now() + 86400 * 1000).toISOString(),
+        fileSizeBytes: job.output.fileSizeBytes,
         durationSeconds: job.durationSeconds,
-        completedAt:     job.timeline.completedAt,
+        completedAt: job.timeline.completedAt,
       },
     });
   } catch (error) { next(error); }
@@ -123,30 +123,46 @@ async function workerDequeue(req, res, next) {
       return res.status(401).json({ success: false, message: 'Unauthorized.' });
     }
 
-    // Atomically find a queued job and lock it to prevent double-processing
+    // 1. Find and lock the job
     const job = await Job.findOneAndUpdate(
       { status: 'queued', deletedAt: null },
-      { $set: { status: 'preprocessing', progressPct: 10, 'timeline.preprocessedAt': new Date() } },
-      { sort: { createdAt: 1 }, new: true }   // oldest first
+      {
+        $set: {
+          status: 'preprocessing',
+          progressPct: 10,
+          'timeline.preprocessedAt': new Date()
+        }
+      },
+      { sort: { createdAt: 1 }, new: true }
     );
 
-    if (!job) return res.status(204).send();   // queue empty
+    if (!job) return res.status(204).send();
 
     logger.info(`Worker dequeued job ${job._id}`);
 
+    // 2. Map inputFiles to bridge the gap between Node.js and Python
+    const formattedInputFiles = job.inputFiles.map(file => ({
+      url: file.secureUrl,             // Map 'secureUrl' to 'url' for the Python script
+      originalName: file.originalName,
+      mimeType: file.mimeType
+    }));
+
+    // 3. Send the response
     res.json({
       success: true,
       job: {
-        jobId:      job._id.toString(),
-        userId:     job.userId.toString(),
-        inputFiles: job.inputFiles,
-        inputType:  job.inputType,
-        settings:   job.settings,
+        jobId: job._id.toString(),
+        userId: job.userId.toString(),
+        inputFiles: formattedInputFiles, // Use the mapped array
+        inputType: job.inputType,
+        settings: job.settings,
       },
     });
-  } catch (error) { next(error); }
+  } catch (error) {
+    logger.error(`Dequeue Error: ${error.message}`);
+    next(error);
+  }
 }
-
 // ─── PATCH /api/jobs/:id/worker-update ───────────────────────────────────────
 // Called by the Vast.ai worker to report progress and final result.
 // Body: { status, progressPct?, output?, error? }
@@ -171,10 +187,10 @@ async function workerUpdate(req, res, next) {
     if (status === 'failed') {
       await job.fail(
         error?.message || 'GPU worker error',
-        error?.code    || 'WORKER_ERROR',
-        error?.stage   || job.status,
+        error?.code || 'WORKER_ERROR',
+        error?.stage || job.status,
       );
-      await notificationService.notifyJobComplete(job.userId, job._id, 'failed').catch(() => {});
+      await notificationService.notifyJobComplete(job.userId, job._id, 'failed').catch(() => { });
       return res.json({ success: true });
     }
 
@@ -184,7 +200,7 @@ async function workerUpdate(req, res, next) {
         return res.json({ success: true });
       }
       await job.transition('done', { progressPct: 100, output });
-      await notificationService.notifyJobComplete(job.userId, job._id, 'done').catch(() => {});
+      await notificationService.notifyJobComplete(job.userId, job._id, 'done').catch(() => { });
       return res.json({ success: true });
     }
 
