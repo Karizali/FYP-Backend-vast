@@ -3,15 +3,15 @@ const { upload } = require('../config/storage');
 const Job = require('../models/Job');
 const logger = require('../utils/logger');
 
-
 // ─── Middleware: assign a folderKey BEFORE multer runs ────────────────────────
 // Used only for the Cloudinary folder path — NOT used as the MongoDB _id.
+// MongoDB will auto-generate a proper ObjectId for the job.
 function assignJobId(req, res, next) {
-  req.jobId = uuidv4();
+  req.jobId = uuidv4();   // only used for Cloudinary folder grouping
   next();
 }
 
-// ─── Middleware: check plan limits ────────────────────────────────────────────
+// ─── Middleware: check plan limits before accepting the upload ─────────────────
 function checkPlanLimit(req, res, next) {
   if (!req.user.canCreateJob()) {
     return res.status(403).json({
@@ -38,10 +38,11 @@ function checkQualitySetting(req, res, next) {
 // ─── Main upload handler ───────────────────────────────────────────────────────
 const handleUpload = [
   checkPlanLimit,
-  checkQualitySetting,
   assignJobId,
-
+  
+  // Multer streams files directly to Cloudinary (no disk touch)
   upload.array('files', 50),
+  checkQualitySetting,
 
   async (req, res, next) => {
     try {
@@ -52,6 +53,7 @@ const handleUpload = [
         });
       }
 
+      // ── Determine input type ──────────────────────────────────────────────
       const mimeTypes = req.files.map((f) => f.mimetype);
       const hasVideo  = mimeTypes.some((m) => m.startsWith('video/'));
       const inputType = hasVideo ? 'video' : 'images';
@@ -66,20 +68,22 @@ const handleUpload = [
       if (!hasVideo && req.files.length < 5) {
         return res.status(400).json({
           success: false,
-          message: `Too few images (${req.files.length}). Upload at least 5; 20–50 recommended.`,
+          message: `Too few images (${req.files.length}). Upload at least 5 images; 20–50 recommended.`,
         });
       }
 
+      // ── Map Cloudinary results to inputFile sub-schema ────────────────────
       const inputFiles = req.files.map((file) => ({
         originalName: file.originalname,
-        cloudinaryId: file.filename,
-        secureUrl:    file.path,
+        cloudinaryId: file.filename,    // public_id from Cloudinary
+        secureUrl:    file.path,        // https URL from Cloudinary
         resourceType: hasVideo ? 'video' : 'image',
         mimeType:     file.mimetype,
         sizeBytes:    file.size,
         folder:       file.folder || null,
       }));
 
+      // ── Parse job settings ────────────────────────────────────────────────
       const settings = {
         enhanceImages: req.body.enhanceImages !== 'false',
         quality: ['fast', 'balanced', 'high'].includes(req.body.quality)
@@ -87,8 +91,8 @@ const handleUpload = [
           : 'balanced',
       };
 
-      // ── Create job in MongoDB with status "queued" ────────────────────────
-      // The Vast.ai worker polls GET /api/jobs/worker-dequeue and picks this up
+      // ── Create job in MongoDB ─────────────────────────────────────────────
+      // Do NOT pass _id — let MongoDB generate a proper ObjectId automatically
       const job = await Job.create({
         userId:    req.user._id,
         title:     req.body.title?.trim() || `Scene – ${new Date().toLocaleDateString()}`,
@@ -97,10 +101,13 @@ const handleUpload = [
         settings,
       });
 
+      // ── Increment user monthly counter ────────────────────────────────────
       await req.user.updateOne({ $inc: { jobsThisMonth: 1 } });
 
+      // ── Push onto Bull queue ──────────────────────────────────────────────
       const jobId = job._id.toString();
-      logger.info(`Job ${jobId} created | user=${req.user._id} | files=${req.files.length} | type=${inputType}`);
+
+      logger.info(`Job ${jobId} queued | user=${req.user._id} | files=${req.files.length} | type=${inputType}`);
 
       res.status(201).json({
         success:          true,
