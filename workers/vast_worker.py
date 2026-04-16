@@ -1,33 +1,11 @@
 """
 Vast.ai GPU Worker — 3D Gaussian Splatting
 ==========================================
-
-This script runs on a rented Vast.ai GPU instance as a long-running process.
-Instead of waiting for Runpod to call a handler, it polls the Redis Bull queue
-directly — picks up jobs, processes them, and reports results back via HTTP.
-
-Pipeline:
-  1. Poll Redis for queued jobs
-  2. Download input files from Cloudinary URLs
-  3. (Optional) Enhance images with Real-ESRGAN
-  4. Run COLMAP for camera pose estimation
-  5. Train 3D Gaussian splatting model
-  6. Convert .ply → .glb
-  7. Upload GLB + thumbnail to Cloudinary
-  8. PATCH job status back to the API via HTTP
-
-Setup on Vast.ai instance:
-  1. SSH into the instance
-  2. git clone your repo
-  3. pip install -r requirements.vast.txt
-  4. cp .env.vast .env && fill in values
-  5. python vast_worker.py
 """
 
 import os
 import sys
 import time
-import json
 import shutil
 import signal
 import requests
@@ -37,21 +15,23 @@ import cloudinary.uploader
 from pathlib import Path
 from dotenv import load_dotenv
 
+# ─── Headless display fix ─────────────────────────────────────────────────────
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 load_dotenv()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-API_BASE_URL        = os.environ["API_BASE_URL"]          # your Railway API URL
-WORKER_SECRET       = os.environ["WORKER_SECRET"]         # shared secret for auth
-CLOUDINARY_CLOUD    = os.environ["CLOUDINARY_CLOUD_NAME"]
-CLOUDINARY_KEY      = os.environ["CLOUDINARY_API_KEY"]
-CLOUDINARY_SECRET   = os.environ["CLOUDINARY_API_SECRET"]
+API_BASE_URL     = os.environ["API_BASE_URL"]
+WORKER_SECRET    = os.environ["WORKER_SECRET"]
+CLOUDINARY_CLOUD = os.environ["CLOUDINARY_CLOUD_NAME"]
+CLOUDINARY_KEY   = os.environ["CLOUDINARY_API_KEY"]
+CLOUDINARY_SECRET = os.environ["CLOUDINARY_API_SECRET"]
 
-POLL_INTERVAL       = int(os.getenv("POLL_INTERVAL_SECONDS", "10"))
-WORK_DIR            = Path(os.getenv("WORK_DIR", "/workspace"))
-GAUSSIAN_REPO       = Path("/gaussian-splatting")
-ESRGAN_SCRIPT       = Path("/Real-ESRGAN/inference_realesrgan.py")
+POLL_INTERVAL  = int(os.getenv("POLL_INTERVAL_SECONDS", "10"))
+WORK_DIR       = Path(os.getenv("WORK_DIR", "/workspace"))
+GAUSSIAN_REPO  = Path("/gaussian-splatting")
+ESRGAN_SCRIPT  = Path("/Real-ESRGAN/inference_realesrgan.py")
 
-# ─── Cloudinary ───────────────────────────────────────────────────────────────
 cloudinary.config(
     cloud_name = CLOUDINARY_CLOUD,
     api_key    = CLOUDINARY_KEY,
@@ -71,23 +51,19 @@ signal.signal(signal.SIGTERM, handle_signal)
 
 # ─── API helpers ──────────────────────────────────────────────────────────────
 HEADERS = {
-    "Content-Type":  "application/json",
+    "Content-Type":    "application/json",
     "X-Worker-Secret": WORKER_SECRET,
 }
 
 def api_patch_status(job_id, status, progress_pct=None, output=None, error=None):
-    """Report job progress/completion back to the Node.js API."""
-    payload = { "status": status }
-    if progress_pct is not None: payload["progressPct"]  = progress_pct
-    if output is not None:       payload["output"]       = output
-    if error is not None:        payload["error"]        = error
-
+    payload = {"status": status}
+    if progress_pct is not None: payload["progressPct"] = progress_pct
+    if output is not None:       payload["output"]      = output
+    if error is not None:        payload["error"]       = error
     try:
         res = requests.patch(
             f"{API_BASE_URL}/api/jobs/{job_id}/worker-update",
-            json    = payload,
-            headers = HEADERS,
-            timeout = 15,
+            json=payload, headers=HEADERS, timeout=15,
         )
         res.raise_for_status()
         print(f"[{job_id}] Status updated → {status} ({progress_pct}%)")
@@ -95,15 +71,13 @@ def api_patch_status(job_id, status, progress_pct=None, output=None, error=None)
         print(f"[{job_id}] WARNING: Could not update status: {e}", file=sys.stderr)
 
 def api_poll_next_job():
-    """Ask the API for the next queued job. Returns job dict or None."""
     try:
         res = requests.post(
             f"{API_BASE_URL}/api/jobs/worker-dequeue",
-            headers = HEADERS,
-            timeout = 10,
+            headers=HEADERS, timeout=10,
         )
         if res.status_code == 204:
-            return None   # queue empty
+            return None
         res.raise_for_status()
         return res.json().get("job")
     except Exception as e:
@@ -148,7 +122,7 @@ def process_job(job):
             enhanced_dir = work / "enhanced"
             enhanced_dir.mkdir(exist_ok=True)
             run_cmd([
-                "python", str(ESRGAN_SCRIPT),
+                "python3", str(ESRGAN_SCRIPT),   # python3 not python
                 "-i", str(images_dir),
                 "-o", str(enhanced_dir),
                 "--model_name", "RealESRGAN_x4plus",
@@ -164,15 +138,15 @@ def process_job(job):
         print(f"[{job_id}] Running COLMAP...")
         colmap_dir = work / "colmap"
         colmap_dir.mkdir(exist_ok=True)
-        run_colmap(images_dir, colmap_dir, job_id)
+        colmap_out = run_colmap(images_dir, colmap_dir, job_id)
 
         # ── Stage 4: Gaussian splatting training ──────────────────────────────
         api_patch_status(job_id, "training", 40)
         print(f"[{job_id}] Training ({iterations} iterations)...")
         output_dir = work / "output"
         run_cmd([
-            "python", str(GAUSSIAN_REPO / "train.py"),
-            "-s", str(colmap_dir),
+            "python3", str(GAUSSIAN_REPO / "train.py"),   # python3 not python
+            "-s", str(colmap_out),
             "-m", str(output_dir),
             "--iterations", str(iterations),
             "--densification_interval", "100",
@@ -180,45 +154,30 @@ def process_job(job):
         ], job_id)
         api_patch_status(job_id, "training", 80)
 
-        # ── Stage 5: Convert .ply → .glb ─────────────────────────────────────
+        # ── Stage 5: Upload .ply to Cloudinary ───────────────────────────────
         api_patch_status(job_id, "converting", 85)
-        print(f"[{job_id}] Converting to GLB...")
+        print(f"[{job_id}] Finding .ply output...")
         ply_path = find_final_ply(output_dir, job_id)
-        glb_path = work / "scene.glb"
-        convert_ply_to_glb(ply_path, glb_path, job_id)
 
-        # ── Stage 6: Generate thumbnail ───────────────────────────────────────
-        thumbnail_path = generate_thumbnail(glb_path, work / "thumbnail.jpg", job_id)
-
-        # ── Stage 7: Upload to Cloudinary ─────────────────────────────────────
         api_patch_status(job_id, "converting", 90)
-        print(f"[{job_id}] Uploading to Cloudinary...")
+        print(f"[{job_id}] Compressing .ply...")
+        ply_path = compress_ply(ply_path, work / "scene_compressed.ply", job_id)
 
-        glb_result = cloudinary.uploader.upload(
-            str(glb_path),
+        print(f"[{job_id}] Uploading .ply to Cloudinary ({ply_path.stat().st_size // 1024 // 1024}MB)...")
+        ply_result = cloudinary.uploader.upload(
+            str(ply_path),
             resource_type = "raw",
             folder        = f"gaussian-outputs/{job_id}",
             public_id     = "scene",
             tags          = [f"job_{job_id}", "output"],
         )
 
-        thumb_result = None
-        if thumbnail_path and thumbnail_path.exists():
-            thumb_result = cloudinary.uploader.upload(
-                str(thumbnail_path),
-                resource_type = "image",
-                folder        = f"gaussian-outputs/{job_id}",
-                public_id     = "thumbnail",
-                tags          = [f"job_{job_id}", "output"],
-            )
-
-        # ── Stage 8: Report completion ────────────────────────────────────────
         output = {
-            "glbCloudinaryId":       glb_result["public_id"],
-            "glbSecureUrl":          glb_result["secure_url"],
-            "thumbnailCloudinaryId": thumb_result["public_id"]  if thumb_result else None,
-            "thumbnailSecureUrl":    thumb_result["secure_url"] if thumb_result else None,
-            "fileSizeBytes":         glb_path.stat().st_size,
+            "glbCloudinaryId":       ply_result["public_id"],    # reusing field for ply
+            "glbSecureUrl":          ply_result["secure_url"],   # reusing field for ply
+            "thumbnailCloudinaryId": None,
+            "thumbnailSecureUrl":    None,
+            "fileSizeBytes":         ply_path.stat().st_size,
         }
 
         api_patch_status(job_id, "done", 100, output=output)
@@ -248,7 +207,6 @@ def main():
 
     while running:
         job = api_poll_next_job()
-
         if job:
             process_job(job)
         else:
@@ -258,7 +216,7 @@ def main():
     print("[Worker] Stopped cleanly.")
 
 
-# ─── Pipeline helpers ─────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def download_file(url: str, dest: Path) -> Path:
     resp = requests.get(url, stream=True, timeout=120)
@@ -286,22 +244,26 @@ def extract_frames(video_path: Path, output_dir: Path, job_id: str, fps: int = 2
 
 
 def run_colmap(images_dir: Path, colmap_dir: Path, job_id: str):
-    db = colmap_dir / "database.db"
-    sparse = colmap_dir / "sparse"
+    db       = colmap_dir / "database.db"
+    sparse   = colmap_dir / "sparse"
     sparse.mkdir(exist_ok=True)
+    dense    = colmap_dir / "sparse_undistorted"
 
+    # Force PINHOLE camera model — Gaussian splatting only accepts
+    # PINHOLE or SIMPLE_PINHOLE (not OPENCV, RADIAL, etc.)
     run_cmd([
         "colmap", "feature_extractor",
-        "--database_path", str(db),
-        "--image_path",    str(images_dir),
+        "--database_path",             str(db),
+        "--image_path",                str(images_dir),
         "--ImageReader.single_camera", "1",
-        "--SiftExtraction.use_gpu", "1",
+        "--ImageReader.camera_model",  "PINHOLE",
+        "--SiftExtraction.use_gpu",    "0",
     ], job_id)
 
     run_cmd([
         "colmap", "exhaustive_matcher",
-        "--database_path", str(db),
-        "--SiftMatching.use_gpu", "1",
+        "--database_path",        str(db),
+        "--SiftMatching.use_gpu", "0",
     ], job_id)
 
     run_cmd([
@@ -317,6 +279,34 @@ def run_colmap(images_dir: Path, colmap_dir: Path, job_id: str):
             "Try images with more overlap and better lighting."
         )
 
+    # Undistort images — converts to PINHOLE if any distortion model slipped in.
+    # image_undistorter output structure:
+    #   dense/
+    #   ├── images/        ← undistorted images
+    #   └── sparse/        ← cameras.bin, images.bin, points3D.bin
+    dense.mkdir(exist_ok=True)
+    model_dir = next(sparse.iterdir())   # e.g. sparse/0
+    run_cmd([
+        "colmap", "image_undistorter",
+        "--image_path",   str(images_dir),
+        "--input_path",   str(model_dir),
+        "--output_path",  str(dense),
+        "--output_type",  "COLMAP",
+    ], job_id)
+
+    # train.py expects: <source>/sparse/0/cameras.bin
+    # image_undistorter outputs: <dense>/sparse/cameras.bin (no subdirectory)
+    # So we move dense/sparse/ → dense/sparse/0/ to match expected structure
+    undist_sparse = dense / "sparse"
+    target_0 = undist_sparse / "0"
+    if undist_sparse.exists() and not target_0.exists():
+        target_0.mkdir()
+        for f in list(undist_sparse.iterdir()):
+            if f.name != "0":
+                f.rename(target_0 / f.name)
+
+    return dense
+
 
 def find_final_ply(output_dir: Path, job_id: str) -> Path:
     candidates = sorted(output_dir.glob("point_cloud/iteration_*/point_cloud.ply"))
@@ -325,44 +315,67 @@ def find_final_ply(output_dir: Path, job_id: str) -> Path:
     return candidates[-1]
 
 
-def convert_ply_to_glb(ply_path: Path, glb_path: Path, job_id: str):
-    """Convert Gaussian splatting .ply to .glb using Blender."""
-    script = ply_path.parent / "convert.py"
-    script.write_text(f"""
-import bpy
-bpy.ops.wm.read_factory_settings(use_empty=True)
-bpy.ops.import_mesh.ply(filepath='{ply_path}')
-bpy.ops.export_scene.gltf(filepath='{glb_path}', export_format='GLB')
-print("GLB export complete")
-""")
-    run_cmd(["blender", "--background", "--python", str(script)], job_id)
-    if not glb_path.exists():
-        raise FileNotFoundError("GLB conversion failed — output not found")
-
-
-def generate_thumbnail(glb_path: Path, output_path: Path, job_id: str):
+def compress_ply(input_path: Path, output_path: Path, job_id: str) -> Path:
+    """
+    Reduce .ply file size by:
+    1. Keeping only the most opaque Gaussians (prune low-opacity ones)
+    2. Quantizing float32 → float16 for color/scale/rotation properties
+    This typically reduces file size by 50-70% with minimal visual quality loss.
+    """
     try:
-        script = glb_path.parent / "thumbnail.py"
-        script.write_text(f"""
-import bpy
-bpy.ops.wm.read_factory_settings(use_empty=True)
-bpy.ops.import_scene.gltf(filepath='{glb_path}')
-bpy.context.scene.render.filepath = '{output_path}'
-bpy.context.scene.render.image_settings.file_format = 'JPEG'
-bpy.context.scene.render.resolution_x = 512
-bpy.context.scene.render.resolution_y = 512
-bpy.ops.render.render(write_still=True)
-""")
-        run_cmd(["blender", "--background", "--python", str(script)], job_id)
-        return output_path if output_path.exists() else None
+        import numpy as np
+        from plyfile import PlyData, PlyElement
+
+        plydata = PlyData.read(str(input_path))
+        vertex  = plydata["vertex"]
+        data    = {prop.name: vertex[prop.name] for prop in vertex.properties}
+
+        original_count = len(data[list(data.keys())[0]])
+
+        # Prune low-opacity Gaussians — opacity is stored as logit
+        # logit(0.05) ≈ -2.94, so keep anything above that threshold
+        if "opacity" in data:
+            opacity_mask  = data["opacity"] > -2.94   # > ~5% opacity
+            kept          = int(opacity_mask.sum())
+            print(f"[{job_id}] Pruning: {original_count} → {kept} Gaussians ({100*kept//original_count}% kept)")
+            data = {k: v[opacity_mask] for k, v in data.items()}
+
+        # Quantize non-position properties to float16 to halve their size
+        position_props = {"x", "y", "z"}
+        new_props = []
+        arrays    = []
+        for name, arr in data.items():
+            if name not in position_props and arr.dtype == np.float32:
+                arr = arr.astype(np.float16)
+            new_props.append((name, arr.dtype.str))
+            arrays.append(arr)
+
+        # Rebuild structured array
+        dtype   = [(name, arr.dtype) for name, arr in zip(data.keys(), arrays)]
+        count   = len(arrays[0])
+        new_arr = np.zeros(count, dtype=dtype)
+        for name, arr in zip(data.keys(), arrays):
+            new_arr[name] = arr
+
+        el  = PlyElement.describe(new_arr, "vertex")
+        out = PlyData([el], text=False)
+        out.write(str(output_path))
+
+        orig_mb = input_path.stat().st_size  / 1024 / 1024
+        comp_mb = output_path.stat().st_size / 1024 / 1024
+        print(f"[{job_id}] Compressed: {orig_mb:.1f}MB → {comp_mb:.1f}MB")
+        return output_path
+
     except Exception as e:
-        print(f"[{job_id}] Thumbnail failed (non-fatal): {e}")
-        return None
+        print(f"[{job_id}] Compression failed (using original): {e}")
+        return input_path   # fall back to original if compression fails
 
 
 def run_cmd(cmd: list, job_id: str = ""):
     print(f"  $ {' '.join(str(c) for c in cmd)}")
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
     if result.returncode != 0:
         raise RuntimeError(
             f"Command failed (exit {result.returncode}):\n"
@@ -377,22 +390,21 @@ def quality_to_iterations(quality: str) -> int:
 
 def parse_error_code(message: str) -> str:
     msg = message.lower()
-    if "colmap" in msg or "sfm" in msg:         return "COLMAP_FAILED"
-    if "out of memory" in msg or "oom" in msg:   return "GPU_OOM"
-    if "too few" in msg:                          return "TOO_FEW_IMAGES"
-    if "cuda" in msg:                             return "CUDA_ERROR"
+    if "colmap" in msg or "sfm" in msg:        return "COLMAP_FAILED"
+    if "out of memory" in msg or "oom" in msg: return "GPU_OOM"
+    if "too few" in msg:                        return "TOO_FEW_IMAGES"
+    if "cuda" in msg:                           return "CUDA_ERROR"
     return "WORKER_ERROR"
 
 
 def humanize_error(message: str) -> str:
-    code = parse_error_code(message)
     return {
-        "COLMAP_FAILED":   "Could not reconstruct 3D geometry. Try more overlapping images.",
-        "GPU_OOM":         "GPU ran out of memory. Try 'fast' quality or fewer images.",
-        "TOO_FEW_IMAGES":  "Not enough usable images. Upload at least 20 from different angles.",
-        "CUDA_ERROR":      "A GPU error occurred. Please try again.",
-        "WORKER_ERROR":    "Processing failed. Please try again.",
-    }.get(code, "Processing failed. Please try again.")
+        "COLMAP_FAILED":  "Could not reconstruct 3D geometry. Try more overlapping images.",
+        "GPU_OOM":        "GPU ran out of memory. Try 'fast' quality or fewer images.",
+        "TOO_FEW_IMAGES": "Not enough usable images. Upload at least 20 from different angles.",
+        "CUDA_ERROR":     "A GPU error occurred. Please try again.",
+        "WORKER_ERROR":   "Processing failed. Please try again.",
+    }.get(parse_error_code(message), "Processing failed. Please try again.")
 
 
 if __name__ == "__main__":
