@@ -12,8 +12,13 @@ import requests
 import subprocess
 import cloudinary
 import cloudinary.uploader
+import json
+import base64
 from pathlib import Path
 from dotenv import load_dotenv
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google.oauth2 import service_account
 
 # ─── Headless display fix ─────────────────────────────────────────────────────
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -31,6 +36,8 @@ POLL_INTERVAL  = int(os.getenv("POLL_INTERVAL_SECONDS", "10"))
 WORK_DIR       = Path(os.getenv("WORK_DIR", "/workspace"))
 GAUSSIAN_REPO  = Path("/gaussian-splatting")
 ESRGAN_SCRIPT  = Path("/Real-ESRGAN/inference_realesrgan.py")
+GDRIVE_FOLDER  = os.environ["GDRIVE_FOLDER_ID"]       # Google Drive folder ID
+GDRIVE_CREDS_B64  = os.environ["GDRIVE_SERVICE_ACCOUNT"]
 
 cloudinary.config(
     cloud_name = CLOUDINARY_CLOUD,
@@ -38,6 +45,48 @@ cloudinary.config(
     api_secret = CLOUDINARY_SECRET,
     secure     = True,
 )
+
+# ─── Google Drive client ──────────────────────────────────────────────────────
+def get_drive_service():
+
+     # Decode the Base64 string from environment into a dictionary
+    decoded_json = base64.b64decode(GDRIVE_CREDS_B64).decode('utf-8')
+    creds_dict = json.loads(decoded_json)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    return build("drive", "v3", credentials=creds)
+
+def upload_to_drive(file_path: Path, job_id: str) -> dict:
+    service = get_drive_service()
+    file_name = f"{job_id}_scene.ply"
+
+    file_metadata = {
+        "name": file_name,
+        "parents": [GDRIVE_FOLDER], # GDRIVE_FOLDER must be the Shared Drive ID or a folder inside it
+    }
+    media = MediaFileUpload(str(file_path), mimetype="application/octet-stream", resumable=True)
+
+    # THE FIX: Add supportsAllDrives=True to EVERY call
+    uploaded = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, name",
+        supportsAllDrives=True  # CRITICAL for Shared Drives
+    ).execute()
+
+    file_id = uploaded["id"]
+
+    # Also add supportsAllDrives here for permissions
+    service.permissions().create(
+        fileId=file_id,
+        body={"type": "anyone", "role": "reader"},
+        supportsAllDrives=True
+    ).execute()
+
+    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    return {"fileId": file_id, "downloadUrl": download_url}
 
 # ─── Graceful shutdown ────────────────────────────────────────────────────────
 running = True
@@ -160,28 +209,20 @@ def process_job(job):
         ply_path = find_final_ply(output_dir, job_id)
 
         api_patch_status(job_id, "converting", 90)
-        print(f"[{job_id}] Compressing .ply...")
-        ply_path = compress_ply(ply_path, work / "scene_compressed.ply", job_id)
 
-        print(f"[{job_id}] Uploading .ply to Cloudinary ({ply_path.stat().st_size // 1024 // 1024}MB)...")
-        ply_result = cloudinary.uploader.upload(
-            str(ply_path),
-            resource_type = "raw",
-            folder        = f"gaussian-outputs/{job_id}",
-            public_id     = "scene",
-            tags          = [f"job_{job_id}", "output"],
-        )
+        # Upload .ply to Google Drive (no file size limit unlike Cloudinary free tier)
+        drive_result = upload_to_drive(ply_path, job_id)
 
         output = {
-            "glbCloudinaryId":       ply_result["public_id"],    # reusing field for ply
-            "glbSecureUrl":          ply_result["secure_url"],   # reusing field for ply
+            "glbCloudinaryId":       drive_result["fileId"],      # storing Drive file ID
+            "glbSecureUrl":          drive_result["downloadUrl"], # direct download URL
             "thumbnailCloudinaryId": None,
             "thumbnailSecureUrl":    None,
             "fileSizeBytes":         ply_path.stat().st_size,
         }
 
         api_patch_status(job_id, "done", 100, output=output)
-        print(f"[{job_id}] ✓ Done! GLB: {glb_result['secure_url']}")
+        print(f"[{job_id}] ✓ Done! Output URL: {drive_result['downloadUrl']}")
 
     except Exception as e:
         error_msg = str(e)

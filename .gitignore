@@ -1,5 +1,8 @@
 .env
+.env.vast
 
 node_modules
 
 firebase-service-account.json.json
+
+google-drive.json
