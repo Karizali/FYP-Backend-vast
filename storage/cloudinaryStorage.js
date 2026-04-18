@@ -109,26 +109,18 @@ async function uploadStream(stream, options = {}) {
   });
 }
 
-// ─── Generate a signed download URL ──────────────────────────────────────────
 /**
- * Creates a time-limited private URL for the Flutter app.
- * GLB expires in 24h, thumbnails in 2h.
- *
- * @param {string} cloudinaryId
- * @param {string} resourceType  - 'raw' | 'image'
- * @param {number} expiresIn     - seconds (default 24h)
- * @returns {string} signed URL
+ * Google Drive doesn't use "Signed URLs" the same way Cloudinary does.
+ * Since the worker already set the file to 'anyone with link: reader',
+ * we just return the direct export link.
  */
-function generateDownloadUrl(cloudinaryId, resourceType = 'raw', expiresIn = 86400) {
-  const expiresAt = Math.floor(Date.now() / 1000) + expiresIn;
+function generateDownloadUrl(fileId) {
+  if (!fileId) return null;
+  
+  // This URL forces a direct download for the Flutter app
+  const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
 
-  const url = cloudinary.utils.private_download_url(cloudinaryId, '', {
-    resource_type: resourceType,
-    expires_at:    expiresAt,
-    attachment:    false,
-  });
-
-  logger.debug(`Storage: signed URL generated for ${cloudinaryId} (expires in ${expiresIn}s)`);
+  logger.debug(`Storage: Google Drive direct link returned for ${fileId}`);
   return url;
 }
 

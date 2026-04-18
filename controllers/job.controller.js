@@ -68,9 +68,9 @@ async function getJobResult(req, res, next) {
     }
 
     const [glbUrl, thumbnailUrl] = await Promise.all([
-      generateDownloadUrl(job.output.glbCloudinaryId, 'raw', 86400),
+      generateDownloadUrl(job.output.glbCloudinaryId),
       job.output.thumbnailCloudinaryId
-        ? generateDownloadUrl(job.output.thumbnailCloudinaryId, 'image', 7200)
+        ? generateDownloadUrl()
         : null,
     ]);
 
