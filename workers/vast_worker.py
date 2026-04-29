@@ -16,9 +16,7 @@ import json
 import base64
 from pathlib import Path
 from dotenv import load_dotenv
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from google.oauth2 import service_account
+from b2sdk.v1 import B2Api, InMemoryAccountInfo
 
 # ─── Headless display fix ─────────────────────────────────────────────────────
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -39,6 +37,10 @@ ESRGAN_SCRIPT  = Path("/Real-ESRGAN/inference_realesrgan.py")
 GDRIVE_FOLDER  = os.environ["GDRIVE_FOLDER_ID"]       # Google Drive folder ID
 GDRIVE_CREDS_B64  = os.environ["GDRIVE_SERVICE_ACCOUNT"]
 
+B2_KEY_ID      = os.environ["B2_KEY_ID"]        # Backblaze application key ID
+B2_APP_KEY     = os.environ["B2_APP_KEY"]        # Backblaze application key
+B2_BUCKET_NAME = os.environ["B2_BUCKET_NAME"]    # e.g. "my-gaussian-outputs"
+
 cloudinary.config(
     cloud_name = CLOUDINARY_CLOUD,
     api_key    = CLOUDINARY_KEY,
@@ -46,48 +48,34 @@ cloudinary.config(
     secure     = True,
 )
 
-# ─── Google Drive client ──────────────────────────────────────────────────────
-def get_drive_service():
+# ─── Backblaze B2 client ──────────────────────────────────────────────────────
+def get_b2_bucket():
+    info = InMemoryAccountInfo()
+    api  = B2Api(info)
+    api.authorize_account("production", B2_KEY_ID, B2_APP_KEY)
+    return api.get_bucket_by_name(B2_BUCKET_NAME)
 
-     # Decode the Base64 string from environment into a dictionary
-    decoded_json = base64.b64decode(GDRIVE_CREDS_B64).decode('utf-8')
-    creds_dict = json.loads(decoded_json)
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict,
-        scopes=["https://www.googleapis.com/auth/drive.file"],
+def upload_to_b2(file_path: Path, job_id: str) -> dict:
+    bucket    = get_b2_bucket()
+    file_name = f"outputs/{job_id}_scene.ply"
+
+    print(f"[{job_id}] Uploading {file_path.stat().st_size / 1024 / 1024:.1f}MB to B2...")
+    file_info = bucket.upload_local_file(
+        local_file=str(file_path),
+        file_name=file_name,
+        content_type="application/octet-stream",
     )
-    return build("drive", "v3", credentials=creds)
 
-def upload_to_drive(file_path: Path, job_id: str) -> dict:
-    service = get_drive_service()
-    file_name = f"{job_id}_scene.ply"
+    # Build the friendly download URL:
+    # https://f<cluster>.backblazeb2.com/file/<bucket>/<file_name>
+    download_url = (
+        f"{bucket.get_download_url(file_name)}"
+    )
 
-    file_metadata = {
-        "name": file_name,
-        "parents": [GDRIVE_FOLDER], # GDRIVE_FOLDER must be the Shared Drive ID or a folder inside it
+    return {
+        "fileId":      file_info.id_,
+        "downloadUrl": download_url,
     }
-    media = MediaFileUpload(str(file_path), mimetype="application/octet-stream", resumable=True)
-
-    # THE FIX: Add supportsAllDrives=True to EVERY call
-    uploaded = service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id, name",
-        supportsAllDrives=True  # CRITICAL for Shared Drives
-    ).execute()
-
-    file_id = uploaded["id"]
-
-    # Also add supportsAllDrives here for permissions
-    service.permissions().create(
-        fileId=file_id,
-        body={"type": "anyone", "role": "reader"},
-        supportsAllDrives=True
-    ).execute()
-
-    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-    return {"fileId": file_id, "downloadUrl": download_url}
-
 # ─── Graceful shutdown ────────────────────────────────────────────────────────
 running = True
 def handle_signal(sig, frame):
@@ -210,19 +198,19 @@ def process_job(job):
 
         api_patch_status(job_id, "converting", 90)
 
-        # Upload .ply to Google Drive (no file size limit unlike Cloudinary free tier)
-        drive_result = upload_to_drive(ply_path, job_id)
+        # Upload .ply to Backblaze B2 (no file size limit unlike Cloudinary free tier)
+        b2_result = upload_to_b2(ply_path, job_id)
 
         output = {
-            "glbCloudinaryId":       drive_result["fileId"],      # storing Drive file ID
-            "glbSecureUrl":          drive_result["downloadUrl"], # direct download URL
+            "glbCloudinaryId":       b2_result["fileId"],
+            "glbSecureUrl":          b2_result["downloadUrl"],
             "thumbnailCloudinaryId": None,
             "thumbnailSecureUrl":    None,
             "fileSizeBytes":         ply_path.stat().st_size,
         }
 
         api_patch_status(job_id, "done", 100, output=output)
-        print(f"[{job_id}] ✓ Done! Output URL: {drive_result['downloadUrl']}")
+        print(f"[{job_id}] ✓ Done! Output URL: {b2_result['downloadUrl']}")
 
     except Exception as e:
         error_msg = str(e)
