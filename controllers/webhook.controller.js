@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const Job = require('../models/Job');
-// GPU worker uploads GLB to Cloudinary directly — webhook just saves the IDs
+// GPU worker uploads GLB to Backblaze B2 directly — webhook just saves the IDs
 const notificationService = require('../services/notifications');
 const logger = require('../utils/logger');
 
@@ -30,7 +30,7 @@ function verifySignature(req) {
 //
 // The GPU worker calls this endpoint to report:
 //   • Progress updates during training
-//   • Completion with the finished GLB file (as base64 or Cloudinary public_id)
+//   • Completion with the finished GLB file (uploaded to B2)
 //   • Failures with error details
 //
 // Expected payload:
@@ -40,12 +40,12 @@ function verifySignature(req) {
 //   progressPct:      number,           // 0–100
 //   runpodJobId:      string,           // Runpod's own job ID (for debugging)
 //
-//   // On completion — worker uploads GLB to Cloudinary and sends back these:
-//   glbCloudinaryId:       string | null,
-//   glbSecureUrl:          string | null,
-//   thumbnailCloudinaryId: string | null,
-//   thumbnailSecureUrl:    string | null,
-//   glbFileSizeBytes:      number | null,
+//   // On completion — worker uploads GLB to B2 and sends back these:
+//   glbB2Id:          string | null,
+//   glbDownloadUrl:   string | null,
+//   thumbnailB2Id:    string | null,
+//   thumbnailDownloadUrl: string | null,
+//   glbFileSizeBytes: number | null,
 //
 //   // On failure:
 //   errorMessage:     string | null,
@@ -66,10 +66,10 @@ async function handleRunpodWebhook(req, res, next) {
       status,
       progressPct,
       runpodJobId,
-      glbCloudinaryId,
-      glbSecureUrl,
-      thumbnailCloudinaryId,
-      thumbnailSecureUrl,
+      glbB2Id,
+      glbDownloadUrl,
+      thumbnailB2Id,
+      thumbnailDownloadUrl,
       glbFileSizeBytes,
       errorMessage,
       errorCode,
@@ -135,18 +135,18 @@ async function handleRunpodWebhook(req, res, next) {
 
     // Attach output files when the worker reports completion
     if (newStatus === 'done') {
-      if (!glbCloudinaryId || !glbSecureUrl) {
+      if (!glbB2Id || !glbDownloadUrl) {
         logger.error(`Webhook: job ${jobId} marked "completed" but missing GLB info`);
         await job.fail('Worker reported completion but GLB output is missing.', 'MISSING_OUTPUT');
         return res.json({ success: true });
       }
 
       extra.output = {
-        glbCloudinaryId,
-        glbSecureUrl,
-        thumbnailCloudinaryId: thumbnailCloudinaryId || null,
-        thumbnailSecureUrl:    thumbnailSecureUrl    || null,
-        fileSizeBytes:         glbFileSizeBytes      || null,
+        glbB2Id,
+        glbDownloadUrl,
+        thumbnailB2Id:    thumbnailB2Id    || null,
+        thumbnailDownloadUrl: thumbnailDownloadUrl || null,
+        fileSizeBytes:    glbFileSizeBytes || null,
       };
       extra.progressPct = 100;
     }

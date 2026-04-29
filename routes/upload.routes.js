@@ -10,7 +10,7 @@ router.use(authenticate);
 /**
  * POST /api/upload
  *
- * Accepts multipart/form-data. Streams files directly to Cloudinary.
+ * Accepts multipart/form-data. Streams files directly to Backblaze B2.
  *
  * Form fields:
  * ┌─────────────────┬──────────────────────────────────────────────────────────┐

@@ -2,7 +2,7 @@ require('dotenv').config();
 const app                  = require('./app');
 const { connectDB }        = require('./config/database');
 const { connectRedis }     = require('./config/redis');
-const { verifyConnection } = require('./storage/cloudinaryStorage');
+const { verifyConnection } = require('./storage/b2Storage');
 const { startCleanupCron } = require('./storage/cleanupCron');
 const logger               = require('./utils/logger');
 
@@ -14,7 +14,7 @@ async function startServer() {
     await connectDB();
     await connectRedis();
 
-    // ── 2. Verify Cloudinary (Layer 3) ────────────────────────────────────────
+    // ── 2. Verify Backblaze B2 (Layer 3) ──────────────────────────────────────
     // Non-fatal: logs a warning but doesn't crash — uploads will fail at runtime
     await verifyConnection();
 
@@ -25,7 +25,7 @@ async function startServer() {
     app.listen(PORT, () => {
       logger.info(`🚀 Gaussian Splatting API running on port ${PORT}`);
       logger.info(`📦 Environment: ${process.env.NODE_ENV}`);
-      logger.info(`🗂️  Storage: Cloudinary`);
+      logger.info(`🗂️  Storage: Backblaze B2`);
       logger.info(`🧹 Cleanup cron: active (daily 02:00 UTC)`);
     });
   } catch (error) {

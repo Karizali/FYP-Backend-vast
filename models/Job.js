@@ -29,12 +29,12 @@ const ALLOWED_TRANSITIONS = {
 const inputFileSchema = new mongoose.Schema(
   {
     originalName:  { type: String, required: true },
-    cloudinaryId:  { type: String, required: true },  // public_id in Cloudinary
-    secureUrl:     { type: String, required: true },  // full https URL
+    b2Id:          { type: String, required: true },  // B2 file ID
+    downloadUrl:   { type: String, required: true },  // full https URL
     resourceType:  { type: String, enum: ['image', 'video'], required: true },
     mimeType:      { type: String, required: true },
     sizeBytes:     { type: Number, required: true },
-    folder:        { type: String },                  // Cloudinary folder path
+    folder:        { type: String },                  // B2 folder path
   },
   { _id: false }
 );
@@ -42,11 +42,11 @@ const inputFileSchema = new mongoose.Schema(
 // ─── Sub-schema: processing output ───────────────────────────────────────────
 const outputSchema = new mongoose.Schema(
   {
-    glbCloudinaryId:       { type: String, default: null },  // raw GLB file
-    glbSecureUrl:          { type: String, default: null },
-    thumbnailCloudinaryId: { type: String, default: null },  // preview image
-    thumbnailSecureUrl:    { type: String, default: null },
-    fileSizeBytes:         { type: Number, default: null },
+    glbB2Id:           { type: String, default: null },  // B2 raw GLB file ID
+    glbDownloadUrl:    { type: String, default: null },
+    thumbnailB2Id:     { type: String, default: null },  // B2 preview image ID
+    thumbnailDownloadUrl: { type: String, default: null },
+    fileSizeBytes:     { type: Number, default: null },
   },
   { _id: false }
 );
@@ -245,7 +245,7 @@ jobSchema.methods.fail = async function (message, code = null, stage = null) {
 };
 
 /**
- * Return a safe summary for the Flutter app (no internal Cloudinary IDs).
+ * Return a safe summary for the Flutter app (no internal B2 file IDs).
  */
 jobSchema.methods.toSummary = function () {
   return {

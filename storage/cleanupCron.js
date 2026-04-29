@@ -1,15 +1,15 @@
 const Job                  = require('../models/Job');
-const { deleteJobFiles }   = require('../storage/cloudinaryStorage');
+const { deleteJobFiles }   = require('../storage/b2Storage');
 const logger               = require('../utils/logger');
 
 // ─── Cleanup Cron ─────────────────────────────────────────────────────────────
 // Runs every night at 02:00. Finds jobs that were soft-deleted (deletedAt is set)
-// but still have Cloudinary files, purges them, then hard-deletes the DB record.
+// but still have B2 files, purges them, then hard-deletes the DB record.
 //
 // Why cron instead of immediate delete?
 //   • deleteJob() does a best-effort immediate cleanup but it can fail
 //   • This cron is the safety net that guarantees files are eventually removed
-//   • Keeps the DELETE /jobs/:id response fast (no blocking on Cloudinary)
+//   • Keeps the DELETE /jobs/:id response fast (no blocking on B2)
 
 const BATCH_SIZE         = 20;    // jobs per run
 const HARD_DELETE_AFTER  = 24;    // hours after soft-delete before DB record is removed
@@ -40,7 +40,7 @@ async function runCleanup() {
 
   for (const job of jobs) {
     try {
-      // 1. Delete all Cloudinary files (input + output)
+      // 1. Delete all B2 files (input + output)
       await deleteJobFiles(job._id.toString());
 
       // 2. Hard-delete the MongoDB record
@@ -51,7 +51,7 @@ async function runCleanup() {
     } catch (err) {
       failed++;
       logger.error(`Cleanup cron: failed to purge job ${job._id}: ${err.message}`);
-      // Leave it for the next run — don't hard-delete if Cloudinary cleanup failed
+      // Leave it for the next run — don't hard-delete if B2 cleanup failed
     }
   }
 

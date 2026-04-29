@@ -96,9 +96,9 @@ function errorHandler(err, req, res, next) { // eslint-disable-line no-unused-va
     });
   }
 
-  // ── Cloudinary errors ────────────────────────────────────────────────────────
-  if (err.http_code) {
-    logger.error(`Cloudinary error ${err.http_code}: ${err.message}`);
+  // ── B2 errors ───────────────────────────────────────────────────────────────
+  if (err.code && err.code.includes('B2')) {
+    logger.error(`B2 error ${err.code}: ${err.message}`);
     return res.status(502).json({
       success: false,
       message: 'Storage service error. Please try again.',

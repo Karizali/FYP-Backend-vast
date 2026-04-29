@@ -1,5 +1,5 @@
 const Job = require('../models/Job');
-const { generateDownloadUrl, deleteJobFiles } = require('../storage/cloudinaryStorage');
+const { generateDownloadUrl, deleteJobFiles } = require('../storage/b2Storage');
 const notificationService = require('../services/notifications');
 const logger = require('../utils/logger');
 
@@ -24,7 +24,7 @@ async function listJobs(req, res, next) {
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
-        .select('-inputFiles.cloudinaryId -inputFiles.secureUrl -inputFiles.folder -output.glbCloudinaryId -output.thumbnailCloudinaryId'),
+        .select('-inputFiles.b2Id -inputFiles.downloadUrl -inputFiles.folder -output.glbB2Id -output.thumbnailB2Id'),
       Job.countDocuments(filter),
     ]);
 
@@ -63,14 +63,14 @@ async function getJobResult(req, res, next) {
       });
     }
 
-    if (!job.output?.glbCloudinaryId) {
+    if (!job.output?.glbB2Id) {
       return res.status(500).json({ success: false, message: 'Output file missing.' });
     }
 
     const [glbUrl, thumbnailUrl] = await Promise.all([
-      generateDownloadUrl(job.output.glbCloudinaryId),
-      job.output.thumbnailCloudinaryId
-        ? generateDownloadUrl()
+      generateDownloadUrl(job.output.glbDownloadUrl),
+      job.output.thumbnailB2Id
+        ? generateDownloadUrl(job.output.thumbnailDownloadUrl)
         : null,
     ]);
 
@@ -107,7 +107,7 @@ async function deleteJob(req, res, next) {
     await job.save();
 
     deleteJobFiles(job._id.toString()).catch(err =>
-      logger.warn(`Cloudinary cleanup failed for job ${job._id}: ${err.message}`)
+      logger.warn(`B2 cleanup failed for job ${job._id}: ${err.message}`)
     );
 
     res.json({ success: true, message: 'Job deleted.' });
@@ -195,7 +195,7 @@ async function workerUpdate(req, res, next) {
     }
 
     if (status === 'done') {
-      if (!output?.glbCloudinaryId) {
+      if (!output?.glbB2Id) {
         await job.fail('Worker completed but GLB output is missing.', 'MISSING_OUTPUT');
         return res.json({ success: true });
       }

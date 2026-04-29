@@ -61,7 +61,7 @@ jobQueue.on('error', (err) => {
  * @param {Object} payload
  * @param {string}   payload.jobId       - MongoDB Job._id
  * @param {string}   payload.userId      - MongoDB User._id
- * @param {Array}    payload.inputFiles  - array of { cloudinaryId, secureUrl, … }
+ * @param {Array}    payload.inputFiles  - array of { b2Id, downloadUrl, … }
  * @param {string}   payload.inputType   - "images" | "video"
  * @param {Object}   payload.settings    - { enhanceImages, quality }
  *

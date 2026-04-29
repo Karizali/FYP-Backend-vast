@@ -21,10 +21,10 @@ const router = express.Router();
  *   runpodJobId:           string,   // Runpod's internal job ID (for debugging)
  *
  *   // Sent only when status === "completed":
- *   glbCloudinaryId:       string,   // Cloudinary public_id of the .glb file
- *   glbSecureUrl:          string,   // direct https URL
- *   thumbnailCloudinaryId: string,   // optional preview image public_id
- *   thumbnailSecureUrl:    string,   // optional preview https URL
+ *   glbB2Id:               string,   // B2 file ID of the .glb file
+ *   glbDownloadUrl:        string,   // direct https URL
+ *   thumbnailB2Id:         string,   // optional preview image B2 file ID
+ *   thumbnailDownloadUrl:  string,   // optional preview https URL
  *   glbFileSizeBytes:      number,
  *
  *   // Sent only when status === "failed":

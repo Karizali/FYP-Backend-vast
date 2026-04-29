@@ -4,10 +4,10 @@ const Job = require('../models/Job');
 const logger = require('../utils/logger');
 
 // ─── Middleware: assign a folderKey BEFORE multer runs ────────────────────────
-// Used only for the Cloudinary folder path — NOT used as the MongoDB _id.
+// Used only for the B2 folder path — NOT used as the MongoDB _id.
 // MongoDB will auto-generate a proper ObjectId for the job.
 function assignJobId(req, res, next) {
-  req.jobId = uuidv4();   // only used for Cloudinary folder grouping
+  req.jobId = uuidv4();   // only used for B2 folder grouping
   next();
 }
 
@@ -40,7 +40,7 @@ const handleUpload = [
   checkPlanLimit,
   assignJobId,
   
-  // Multer streams files directly to Cloudinary (no disk touch)
+  // Multer streams files directly to B2 (no disk touch)
   upload.array('files', 50),
   checkQualitySetting,
 
@@ -72,11 +72,11 @@ const handleUpload = [
         });
       }
 
-      // ── Map Cloudinary results to inputFile sub-schema ────────────────────
+      // ── Map B2 results to inputFile sub-schema ────────────────────────────
       const inputFiles = req.files.map((file) => ({
         originalName: file.originalname,
-        cloudinaryId: file.filename,    // public_id from Cloudinary
-        secureUrl:    file.path,        // https URL from Cloudinary
+        b2Id:         file.filename,      // B2 file ID
+        downloadUrl:  file.path,          // https URL from B2
         resourceType: hasVideo ? 'video' : 'image',
         mimeType:     file.mimetype,
         sizeBytes:    file.size,
