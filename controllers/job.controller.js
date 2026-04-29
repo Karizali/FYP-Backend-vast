@@ -142,7 +142,7 @@ async function workerDequeue(req, res, next) {
 
     // 2. Map inputFiles to bridge the gap between Node.js and Python
     const formattedInputFiles = job.inputFiles.map(file => ({
-      url: file.secureUrl,             // Map 'secureUrl' to 'url' for the Python script
+      url: file.downloadUrl,             // Map 'downloadUrl' to 'url' for the Python script
       originalName: file.originalName,
       mimeType: file.mimeType
     }));
