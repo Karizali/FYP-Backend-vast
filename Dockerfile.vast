@@ -7,14 +7,51 @@ ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 ENV FORCE_CUDA=1
 ENV CUDA_HOME=/usr/local/cuda
 ENV PATH="/usr/local/cuda/bin:${PATH}"
+# Tell COLMAP (and any other GL app) to use EGL instead of GLX.
+# With this set, COLMAP creates a GPU OpenGL context with no display needed.
+ENV PYOPENGL_PLATFORM=egl
 
 # ─── System packages ──────────────────────────────────────────────────────────
+# NOTE: No `colmap` from apt — we build from source below with EGL+CUDA.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git wget curl ffmpeg colmap \
+    git wget curl ffmpeg \
     libgl1 libglib2.0-0 tzdata ninja-build \
-    python3 python3-pip python-is-python3 \
-    python3-dev \
+    python3 python3-pip python-is-python3 python3-dev \
+    # COLMAP build dependencies
+    cmake build-essential \
+    libboost-program-options-dev libboost-filesystem-dev \
+    libboost-graph-dev libboost-system-dev \
+    libeigen3-dev libflann-dev libfreeimage-dev \
+    libmetis-dev libgoogle-glog-dev libgflags-dev \
+    libsqlite3-dev libglew-dev qtbase5-dev libqt5opengl5-dev \
+    libcgal-dev libceres-dev \
+    # EGL headers (needed for headless OpenGL)
+    libegl1-mesa-dev libgles2-mesa-dev \
+    # SiftGPU (bundled) needs these
+    libgl1-mesa-dev mesa-utils \
     && rm -rf /var/lib/apt/lists/*
+
+# ─── Build COLMAP from source with EGL + CUDA ────────────────────────────────
+# Using 3.9.1 — stable release, well tested with Gaussian Splatting pipelines.
+ARG COLMAP_VERSION=3.9.1
+RUN git clone https://github.com/colmap/colmap.git /colmap-src \
+    --branch ${COLMAP_VERSION} --depth 1
+
+RUN cmake -S /colmap-src -B /colmap-src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCUDA_ENABLED=ON \
+      -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90" \
+      -DFETCH_SIFTGPU=ON \
+      # EGL = headless GPU OpenGL — no display server required
+      -DGUI_ENABLED=OFF \
+      -DOPENGL_ENABLED=ON \
+      -DEGL_ENABLED=ON \
+    && cmake --build /colmap-src/build -j$(nproc) \
+    && cmake --install /colmap-src/build \
+    && rm -rf /colmap-src
+
+# Verify COLMAP is on PATH and was built with EGL
+RUN colmap help | head -5
 
 # ─── Remove any pre-installed opencv that requires NumPy 2 ───────────────────
 RUN pip3 uninstall -y opencv-python opencv-contrib-python 2>/dev/null || true
@@ -40,12 +77,14 @@ print(f"Created shim at {dist_dir}")
 PYEOF
 
 # ─── PyTorch (CUDA 12.1) ─────────────────────────────────────────────────────
+# torch 2.1.0 wheel hashes on pytorch CDN are stale/mismatched.
+# 2.3.1 is the latest stable cu121 build with correct hashes.
 RUN pip3 install --no-cache-dir \
-    torch==2.1.0+cu121 \
-    torchvision==0.16.0+cu121 \
+    torch==2.3.1+cu121 \
+    torchvision==0.18.1+cu121 \
     --index-url https://download.pytorch.org/whl/cu121
 
-# ─── Re-lock numpy after torch ───────────────────────────────────────────────
+# ─── Re-lock numpy after torch (torch pulls in numpy 2.x as a dep) ───────────
 RUN pip3 install --no-cache-dir --force-reinstall "numpy==1.26.4"
 
 # ─── Core packages ───────────────────────────────────────────────────────────
@@ -57,13 +96,18 @@ RUN pip3 install --no-cache-dir \
     plyfile \
     tqdm \
     b2sdk==1.28.0
-    # removed: google-api-python-client, google-auth
 
 # ─── Real-ESRGAN ─────────────────────────────────────────────────────────────
 RUN git clone https://github.com/xinntao/Real-ESRGAN.git /Real-ESRGAN
 
+# basicsr imports torchvision.transforms.functional_tensor which was removed
+# in torchvision 0.17+. Patch the one bad import line directly — most reliable
+# fix regardless of which basicsr version pip resolves to.
 RUN pip3 install --no-cache-dir basicsr facexlib gfpgan && \
-    pip3 install --no-cache-dir -r /Real-ESRGAN/requirements.txt
+    pip3 install --no-cache-dir -r /Real-ESRGAN/requirements.txt && \
+    sed -i \
+      's/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms.functional import rgb_to_grayscale/' \
+      /usr/local/lib/python3.10/dist-packages/basicsr/data/degradations.py
 
 RUN pip3 install --no-cache-dir --force-reinstall \
     "numpy==1.26.4" \
@@ -90,7 +134,12 @@ RUN pip3 install --no-cache-dir \
 # ─── Final numpy lock ────────────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir --force-reinstall "numpy==1.26.4"
 
-# ─── Copy worker ─────────────────────────────────────────────────────────────
+# ─── COLMAP vocab tree (required for loop detection in sequential matcher) ────
+# Without this file, --SequentialMatching.loop_detection 1 crashes with:
+#   "Check failed: file.is_open()" (visual_index.h:569)
+RUN mkdir -p /colmap && \
+    wget -q -O /colmap/vocab_tree_flickr100K_words256K.bin \
+      https://demuc.de/colmap/vocab_tree_flickr100K_words256K.bin
 COPY workers/vast_worker.py /vast_worker.py
 WORKDIR /workspace
 CMD ["python3", "-u", "/vast_worker.py"]

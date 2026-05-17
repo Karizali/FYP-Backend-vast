@@ -26,12 +26,13 @@ function checkPlanLimit(req, res, next) {
 
 // ─── Middleware: validate quality setting against plan ─────────────────────────
 function checkQualitySetting(req, res, next) {
-  if (req.body.quality === 'high' && req.user.plan === 'free') {
-    return res.status(403).json({
-      success: false,
-      message: 'High quality is only available on the Pro plan. Use "fast" or "balanced".',
-    });
-  }
+  // if (req.body.quality === 'high' && req.user.plan === 'free') {
+  //   return res.status(403).json({
+  //     success: false,
+  //     message: 'High quality is only available on the Pro plan. Use "fast" or "balanced".',
+  //   });
+  // }
+  
   next();
 }
 
