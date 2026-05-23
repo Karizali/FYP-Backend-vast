@@ -30,7 +30,7 @@ async function getBucket() {
 }
 
 // ─── Allowed MIME types ────────────────────────────────────────────────────────
-const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const ALLOWED_IMAGE_TYPES = ['image/jpg','image/jpeg', 'image/png', 'image/webp'];
 const ALLOWED_VIDEO_TYPES = ['video/mp4', 'video/quicktime', 'video/x-msvideo'];
 const ALLOWED_TYPES = [...ALLOWED_IMAGE_TYPES, ...ALLOWED_VIDEO_TYPES];
 
@@ -136,7 +136,7 @@ const upload = multer({
   fileFilter,
   limits: {
     fileSize: 1000 * 1024 * 1024, // 1000 MB per file (mobile videos can be large)
-    files: 50,
+    files: 300,
   },
 });
 

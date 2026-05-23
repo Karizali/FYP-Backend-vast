@@ -84,7 +84,7 @@ function errorHandler(err, req, res, next) { // eslint-disable-line no-unused-va
   if (err.code === 'LIMIT_FILE_COUNT') {
     return res.status(400).json({
       success: false,
-      message: 'Too many files. Maximum 50 files per upload.',
+      message: 'Too many files. Maximum 300 files per upload.',
     });
   }
 

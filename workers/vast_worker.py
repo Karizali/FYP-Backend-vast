@@ -1,29 +1,59 @@
 """
 Vast.ai GPU Worker — 3D Gaussian Splatting
-==========================================
-Room-scale reconstruction fixes:
-  - COLMAP: sequential+loop matcher instead of exhaustive, proper camera model
-  - Training: indoor-tuned hyperparams, scene extent, white background off
-  - Compression: smarter opacity threshold
+===========================================
+Pipeline:
+  1. Download video / images
+  2. Extract frames (ffmpeg) — original, unmodified
+  3. COLMAP  — feature extraction, matching, mapping, undistortion
+  4. Gaussian Splatting training
+  5. Compress .ply for mobile
+  6. Upload to Backblaze B2
+
+No image enhancement — ESRGAN removed entirely.
+COLMAP and training both use the same raw frames.
 """
 
 import os
 import sys
 import time
+import math
 import shutil
 import signal
+import logging
 import requests
 import subprocess
-import json
-import base64
-import traceback
 from pathlib import Path
 from dotenv import load_dotenv
 from b2sdk.v1 import B2Api, InMemoryAccountInfo
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
 load_dotenv()
+
+# ─── Logging — writes to both stdout AND /workspace/worker.log ────────────────
+LOG_FILE = Path("/workspace/worker.log")
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),          # visible in Vast.ai console
+        logging.FileHandler(str(LOG_FILE), mode="a"), # persists on disk
+    ]
+)
+log = logging.getLogger()
+
+# Redirect print() to logger so all existing print() calls also go to file
+class _PrintToLog:
+    def write(self, msg):
+        if msg.strip():
+            log.info(msg.rstrip())
+    def flush(self):
+        pass
+
+sys.stdout = _PrintToLog()
+sys.stderr = _PrintToLog()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 API_BASE_URL  = os.environ["API_BASE_URL"]
@@ -32,49 +62,19 @@ WORKER_SECRET = os.environ["WORKER_SECRET"]
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "10"))
 WORK_DIR      = Path(os.getenv("WORK_DIR", "/workspace"))
 GAUSSIAN_REPO = Path("/gaussian-splatting")
-ESRGAN_SCRIPT = Path("/Real-ESRGAN/inference_realesrgan.py")
+VOCAB_TREE    = Path("/colmap/vocab_tree_flickr100K_words256K.bin")
 
 B2_KEY_ID      = os.environ["B2_KEY_ID"]
 B2_APP_KEY     = os.environ["B2_APP_KEY"]
 B2_BUCKET_NAME = os.environ["B2_BUCKET_NAME"]
 
-# ─── Per-quality tuning (room-scale optimised) ────────────────────────────────
-#
-# Key changes vs original:
-#   • fps bumped up — denser frame sampling covers walls/ceiling better
-#   • max_frames raised — more views = fewer holes in walls
-#   • iterations increased — rooms have far more Gaussians needed than objects
-#   • grad_thresh lowered — lets the trainer densify fine wall/floor detail
-#   • densify_until raised — keep adding Gaussians well into training
-#   • min_opacity added — prune floaters without killing real geometry
-#
+# ─── Quality profiles ─────────────────────────────────────────────────────────
+#            fps  max_frames  iterations  grad_thresh  densify_until  min_opacity  mobile_target
 QUALITY_PROFILES = {
-    #            fps  max_frames  iterations  grad_thresh  densify_until  min_opacity
-    "fast":     ( 3,  80,         20_000,     0.0002,      12_000,        0.005),
-    "balanced": ( 4,  120,        60_000,     0.0001,      35_000,        0.004),
-    "high":     ( 5,  180,        100_000,    0.00005,     60_000,        0.003),
+    "fast":     ( 3,  100,        20_000,     0.0002,      10_000,        0.005,       500_000),
+    "balanced": ( 4,  150,        50_000,     0.0001,      28_000,        0.004,       800_000),
+    "high":     ( 5,  200,        80_000,     0.0001,      30_000,        0.003,     1_000_000),
 }
-
-# ─── Backblaze B2 ─────────────────────────────────────────────────────────────
-def get_b2_bucket():
-    info = InMemoryAccountInfo()
-    api  = B2Api(info)
-    api.authorize_account("production", B2_KEY_ID, B2_APP_KEY)
-    return api.get_bucket_by_name(B2_BUCKET_NAME)
-
-def upload_to_b2(file_path: Path, job_id: str) -> dict:
-    bucket    = get_b2_bucket()
-    file_name = f"outputs/{job_id}_scene.ply"
-    print(f"[{job_id}] Uploading {file_path.stat().st_size / 1024 / 1024:.1f}MB to B2...")
-    file_info = bucket.upload_local_file(
-        local_file=str(file_path),
-        file_name=file_name,
-        content_type="application/octet-stream",
-    )
-    return {
-        "fileId":      file_info.id_,
-        "downloadUrl": bucket.get_download_url(file_name),
-    }
 
 # ─── Graceful shutdown ────────────────────────────────────────────────────────
 running = True
@@ -86,11 +86,26 @@ def handle_signal(sig, frame):
 signal.signal(signal.SIGINT,  handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
 
+# ─── B2 ───────────────────────────────────────────────────────────────────────
+def get_b2_bucket():
+    info = InMemoryAccountInfo()
+    api  = B2Api(info)
+    api.authorize_account("production", B2_KEY_ID, B2_APP_KEY)
+    return api.get_bucket_by_name(B2_BUCKET_NAME)
+
+def upload_to_b2(file_path: Path, job_id: str) -> dict:
+    bucket    = get_b2_bucket()
+    file_name = f"outputs/{job_id}_scene.ply"
+    print(f"[{job_id}] Uploading {file_path.stat().st_size/1024/1024:.1f}MB to B2...")
+    file_info = bucket.upload_local_file(
+        local_file=str(file_path),
+        file_name=file_name,
+        content_type="application/octet-stream",
+    )
+    return {"fileId": file_info.id_, "downloadUrl": bucket.get_download_url(file_name)}
+
 # ─── API helpers ──────────────────────────────────────────────────────────────
-HEADERS = {
-    "Content-Type":    "application/json",
-    "X-Worker-Secret": WORKER_SECRET,
-}
+HEADERS = {"Content-Type": "application/json", "X-Worker-Secret": WORKER_SECRET}
 
 def api_patch_status(job_id, status, progress_pct=None, output=None, error=None):
     payload = {"status": status}
@@ -121,35 +136,42 @@ def api_poll_next_job():
         print(f"[Worker] Poll error: {e}", file=sys.stderr)
         return None
 
-# ─── Main pipeline ────────────────────────────────────────────────────────────
+# ─── Pipeline ─────────────────────────────────────────────────────────────────
 def process_job(job):
-    job_id      = job["jobId"]
-    input_files = job["inputFiles"]
-    input_type  = job["inputType"]
-    settings    = job["settings"]
-    enhance     = settings.get("enhanceImages", True)
-    quality     = settings.get("quality", "balanced")
+    job_id     = job["jobId"]
+    input_files= job["inputFiles"]
+    input_type = job["inputType"]
+    settings   = job["settings"]
+    quality    = settings.get("quality", "balanced")
 
-    fps, max_frames, iterations, grad_thresh, densify_until, min_opacity = QUALITY_PROFILES[quality]
+    fps, max_frames, iterations, grad_thresh, densify_until, min_opacity, mobile_target = \
+        QUALITY_PROFILES.get(quality, QUALITY_PROFILES["balanced"])
 
     work = WORK_DIR / job_id
     work.mkdir(parents=True, exist_ok=True)
 
-    # Prevent CUDA OOM on large scenes — 512 MB chunks is safe for 24 GB VRAM
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+    # CUDA memory fragmentation fix.
+    # expandable_segments is NOT used — it causes an internal assert failure
+    # in older PyTorch builds (confirmed crash at CUDACachingAllocator.cpp:2549).
+    # max_split_size_mb + garbage_collection_threshold are safe on all versions.
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+        "max_split_size_mb:64,"
+        "garbage_collection_threshold:0.7"
+    )
 
     try:
         print(f"\n[{job_id}] ═══ Starting pipeline ═══")
-        print(f"[{job_id}] type={input_type} quality={quality} enhance={enhance} iter={iterations}")
+        print(f"[{job_id}] type={input_type}  quality={quality}  iter={iterations}")
 
-        # ── Stage 1: Download inputs ───────────────────────────────────────────
+        # ── Stage 1: Download ──────────────────────────────────────────────────
         api_patch_status(job_id, "preprocessing", 10)
         raw_dir = work / "raw"
         raw_dir.mkdir(exist_ok=True)
 
         if input_type == "video":
             video_path = download_file(input_files[0]["url"], raw_dir / "input.mp4")
-            images_dir = extract_frames(video_path, work / "frames", job_id, fps=fps, max_frames=max_frames)
+            images_dir = extract_frames(video_path, work / "frames", job_id,
+                                        fps=fps, max_frames=max_frames)
         else:
             images_dir = raw_dir
             for i, f in enumerate(input_files):
@@ -157,83 +179,54 @@ def process_job(job):
                 download_file(f["url"], raw_dir / f"{i:04d}{ext}")
             print(f"[{job_id}] Downloaded {len(input_files)} images")
 
-        # ── Stage 2: Image enhancement ────────────────────────────────────────
-        api_patch_status(job_id, "preprocessing", 20)
-        if enhance and ESRGAN_SCRIPT.exists():
-            if not _cuda_available():
-                print(f"[{job_id}] CUDA unavailable (driver mismatch?) — skipping ESRGAN to avoid CPU OOM")
-            else:
-                print(f"[{job_id}] Enhancing with Real-ESRGAN (batch mode)...")
-                enhanced_dir = work / "enhanced"
-                enhanced_dir.mkdir(exist_ok=True)
-                esrgan_ok = _run_esrgan_batched(
-                    images_dir, enhanced_dir, job_id, batch_size=10
-                )
-                if esrgan_ok:
-                    images_dir = enhanced_dir
-        else:
-            print(f"[{job_id}] Skipping enhancement")
-
-        # ── Stage 3: COLMAP ───────────────────────────────────────────────────
+        # ── Stage 2: COLMAP ────────────────────────────────────────────────────
         api_patch_status(job_id, "training", 30)
-        print(f"[{job_id}] Running COLMAP (room-scale settings)...")
+        print(f"[{job_id}] Running COLMAP...")
         colmap_dir = work / "colmap"
         colmap_dir.mkdir(exist_ok=True)
-        colmap_out = run_colmap(images_dir, colmap_dir, job_id, is_video=(input_type == "video"))
+        colmap_out = run_colmap(images_dir, colmap_dir, job_id,
+                                is_video=(input_type == "video"))
 
-        # ── Stage 4: Gaussian splatting training ──────────────────────────────
+        # ── Stage 3: Gaussian Splatting training ───────────────────────────────
         api_patch_status(job_id, "training", 40)
         print(f"[{job_id}] Training ({iterations} iters, grad_thresh={grad_thresh})...")
         output_dir = work / "output"
 
+        ckpt_iters = list(range(5_000, iterations, 5_000))
         run_cmd([
             "python3", str(GAUSSIAN_REPO / "train.py"),
             "-s", str(colmap_out),
             "-m", str(output_dir),
-            # ── Iteration schedule ──────────────────────────────────────────
             "--iterations",              str(iterations),
             "--save_iterations",         str(iterations),
-            "--test_iterations",         "-1",           # skip test renders — saves VRAM
-            # ── Densification (critical for rooms) ─────────────────────────
+            "--test_iterations",         "-1",
             "--densification_interval",  "100",
             "--densify_until_iter",      str(densify_until),
             "--densify_grad_threshold",  str(grad_thresh),
-            # ── Opacity / pruning ───────────────────────────────────────────
             "--opacity_reset_interval",  "3000",
-            # --min_opacity is not a train.py flag in this repo version.
-            # Floater pruning is handled post-training in compress_ply().
-            # ── Scene scale (IMPORTANT for rooms) ──────────────────────────
-            # Rooms are large; default cameras_extent can be too small causing
-            # Gaussians to be clipped. Let train.py auto-compute from COLMAP.
-            # Do NOT pass --scene_extent — rely on automatic calculation.
-            # ── Background ─────────────────────────────────────────────────
-            # Rooms have no "outside" — white_background causes bright halos
-            # on walls. Use black (default) so wall/floor edges blend cleanly.
-            # (Do NOT pass --white_background)
-            # ── SH degree ───────────────────────────────────────────────────
-            # sh_degree=3 captures view-dependent effects on glossy floors,
-            # windows, and mirrors common in indoor scenes.
             "--sh_degree",               "3",
+            "--checkpoint_iterations",   *[str(i) for i in ckpt_iters],
             "--quiet",
         ], job_id)
         api_patch_status(job_id, "training", 80)
 
-        # ── Stage 5: Compress .ply ────────────────────────────────────────────
+        # ── Stage 4: Compress .ply for mobile ─────────────────────────────────
         api_patch_status(job_id, "converting", 85)
-        ply_path = find_final_ply(output_dir, job_id)
-        compressed_path = ply_path.parent / "point_cloud_compressed.ply"
-        ply_path = compress_ply(ply_path, compressed_path, job_id, min_opacity=min_opacity)
+        ply_path        = find_final_ply(output_dir, job_id)
+        compressed_path = ply_path.parent / "point_cloud_mobile.ply"
+        ply_path        = compress_ply(ply_path, compressed_path, job_id,
+                                       min_opacity=min_opacity,
+                                       mobile_target=mobile_target)
 
-        # ── Stage 6: Upload ───────────────────────────────────────────────────
+        # ── Stage 5: Upload ────────────────────────────────────────────────────
         api_patch_status(job_id, "converting", 90)
         b2_result = upload_to_b2(ply_path, job_id)
 
-        output = {
+        api_patch_status(job_id, "done", 100, output={
             "glbB2Id":        b2_result["fileId"],
             "glbDownloadUrl": b2_result["downloadUrl"],
             "fileSizeBytes":  ply_path.stat().st_size,
-        }
-        api_patch_status(job_id, "done", 100, output=output)
+        })
         print(f"[{job_id}] ✓ Done → {b2_result['downloadUrl']}")
 
     except Exception as e:
@@ -250,85 +243,6 @@ def process_job(job):
 
 
 # ─── Main loop ────────────────────────────────────────────────────────────────
-def run_startup_diagnostics():
-    """
-    Runs once at container start. Prints results to stdout so they appear
-    in Vast.ai logs. Identifies ESRGAN/CUDA issues before any job runs.
-    """
-    import traceback
-    print("\n" + "="*50)
-    print("  STARTUP DIAGNOSTICS")
-    print("="*50)
-
-    # 1. basicsr patch
-    try:
-        import pathlib, inspect
-        import basicsr.data.degradations as deg
-        src = pathlib.Path(inspect.getfile(deg)).read_text()
-        if "functional_tensor" in src:
-            print("[DIAG] ✗ basicsr patch MISSING — functional_tensor still present")
-            print("       ESRGAN will fail. Rebuild image with sed patch in Dockerfile.")
-        else:
-            print("[DIAG] ✓ basicsr patch OK")
-    except Exception as e:
-        print(f"[DIAG] ✗ basicsr import failed: {e}")
-
-    # 2. CUDA
-    try:
-        import torch
-        if torch.cuda.is_available():
-            print(f"[DIAG] ✓ CUDA OK — {torch.cuda.get_device_name(0)}")
-        else:
-            print("[DIAG] ✗ CUDA unavailable — ESRGAN will be skipped")
-    except Exception as e:
-        print(f"[DIAG] ✗ torch import failed: {e}")
-
-    # 3. ESRGAN dry run on a synthetic image
-    try:
-        import subprocess, tempfile
-        from PIL import Image
-        with tempfile.TemporaryDirectory() as tmp:
-            tin  = Path(tmp) / "in";  tin.mkdir()
-            tout = Path(tmp) / "out"; tout.mkdir()
-            Image.new("RGB", (64, 64), color=(100, 100, 100)).save(tin / "test.jpg")
-            r = subprocess.run(
-                ["python3", str(ESRGAN_SCRIPT),
-                 "-i", str(tin), "-o", str(tout),
-                 "--model_name", "RealESRGAN_x4plus",
-                 "--outscale", "2", "--fp32",
-                 "--tile", "256", "--tile_pad", "16", "--pre_pad", "0"],
-                capture_output=True, text=True, timeout=120
-            )
-            out_files = list(tout.iterdir())
-            if r.returncode != 0:
-                print(f"[DIAG] ✗ ESRGAN crashed (exit {r.returncode})")
-                print(f"       stderr: {(r.stderr or r.stdout)[-500:]}")
-            elif not out_files:
-                print(f"[DIAG] ✗ ESRGAN ran but wrote 0 files")
-                print(f"       stdout: {r.stdout[-500:]}")
-            else:
-                print(f"[DIAG] ✓ ESRGAN OK — wrote {out_files[0].name}")
-    except Exception as e:
-        print(f"[DIAG] ✗ ESRGAN test failed: {e}\n{traceback.format_exc()}")
-
-    # 4. COLMAP
-    try:
-        r = subprocess.run(["colmap", "help"], capture_output=True, text=True)
-        first_line = (r.stdout or r.stderr).splitlines()[0] if (r.stdout or r.stderr) else "no output"
-        print(f"[DIAG] ✓ COLMAP OK — {first_line}")
-    except Exception as e:
-        print(f"[DIAG] ✗ COLMAP not found: {e}")
-
-    # 5. Vocab tree
-    vt = Path("/colmap/vocab_tree_flickr100K_words256K.bin")
-    if vt.exists():
-        print(f"[DIAG] ✓ Vocab tree OK ({vt.stat().st_size // 1024 // 1024}MB)")
-    else:
-        print(f"[DIAG] ✗ Vocab tree MISSING at {vt} — loop detection will be disabled")
-
-    print("="*50 + "\n")
-
-
 def main():
     print("=" * 50)
     print("  Vast.ai GPU Worker — Gaussian Splatting")
@@ -347,136 +261,6 @@ def main():
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def _ensure_virtual_display():
-    """
-    Start a minimal Xvfb virtual display if available.
-    COLMAP's GPU SIFT needs an OpenGL context even on headless servers.
-    This is a best-effort helper — if Xvfb isn't installed it's a no-op
-    because we already force use_gpu=0 for feature extraction.
-    Sets DISPLAY=:99 so any subsequent OpenGL call can find it.
-    """
-    if os.environ.get("DISPLAY"):
-        return  # already set
-    try:
-        subprocess.Popen(
-            ["Xvfb", ":99", "-screen", "0", "1024x768x24"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        os.environ["DISPLAY"] = ":99"
-        time.sleep(1)  # give Xvfb a moment to start
-        print("[COLMAP] Started Xvfb virtual display on :99")
-    except FileNotFoundError:
-        pass  # Xvfb not installed — fine, we use CPU SIFT anyway
-
-
-def _cuda_available() -> bool:
-    """
-    Check CUDA availability without importing torch at module level.
-    Returns False if driver/HW mismatch (error 804) or no GPU present.
-    """
-    try:
-        import torch
-        return torch.cuda.is_available()
-    except Exception:
-        return False
-
-
-def _run_esrgan_batched(images_dir: Path, enhanced_dir: Path,
-                        job_id: str, batch_size: int = 10) -> bool:
-    """
-    Run ESRGAN in small batches to avoid OOM.
-    Staging dirs live inside enhanced_dir to guarantee correct path resolution.
-    Returns True if at least some frames were enhanced, False on total failure.
-    """
-    import shutil as _shutil
-
-    # Only process actual image files — skip hidden files or directories
-    all_frames = sorted(
-        f for f in images_dir.iterdir()
-        if f.is_file() and f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
-    )
-    total     = len(all_frames)
-    succeeded = 0
-
-    if total == 0:
-        print(f"[{job_id}] WARNING: No image files found in {images_dir}")
-        return False
-
-    # Use a fixed tmp dir inside the work directory (same filesystem as images_dir)
-    # so renames are atomic and paths are always predictable.
-    tmp_root = enhanced_dir.parent / "_esrgan_tmp"
-    tmp_root.mkdir(exist_ok=True)
-
-    try:
-        for batch_idx, batch_start in enumerate(range(0, total, batch_size)):
-            batch     = all_frames[batch_start:batch_start + batch_size]
-            batch_in  = tmp_root / f"in_{batch_idx}"
-            batch_out = tmp_root / f"out_{batch_idx}"
-            batch_in.mkdir(exist_ok=True)
-            batch_out.mkdir(exist_ok=True)
-
-            for f in batch:
-                _shutil.copy2(f, batch_in / f.name)
-
-            # Sanity check — make sure files actually landed
-            staged = list(batch_in.iterdir())
-            if not staged:
-                print(f"[{job_id}] WARNING: Staging copy failed for batch {batch_idx}")
-                for f in batch:
-                    _shutil.copy2(f, enhanced_dir / f.name)
-                continue
-
-            try:
-                output = run_cmd([
-                    "python3", str(ESRGAN_SCRIPT),
-                    "-i", str(batch_in),
-                    "-o", str(batch_out),
-                    "--model_name", "RealESRGAN_x4plus",
-                    "--outscale", "2",
-                    "--fp32",
-                    "--tile", "256",        # process in 256×256 tiles — prevents OOM on 4K frames
-                    "--tile_pad", "16",     # overlap between tiles to avoid seam artifacts
-                    "--pre_pad", "0",
-                ], job_id)
-                # Log last 20 lines of ESRGAN output for diagnosis
-                tail = "\n".join(output.strip().splitlines()[-20:])
-                print(f"[{job_id}] ESRGAN stdout tail:\n{tail}")
-
-                out_files = list(batch_out.iterdir())
-                if not out_files:
-                    raise RuntimeError(
-                        f"ESRGAN ran without error but wrote 0 files "
-                        f"(input had {len(staged)} files in {batch_in})\n"
-                        f"ESRGAN output was:\n{tail}"
-                    )
-                for out_f in out_files:
-                    out_f.rename(enhanced_dir / out_f.name)
-                succeeded += len(out_files)
-                pct = int(100 * min(batch_start + len(batch), total) / total)
-                print(f"[{job_id}] ESRGAN batch {batch_idx+1}: "
-                      f"{succeeded}/{total} frames ({pct}%)")
-
-            except RuntimeError as e:
-                print(f"[{job_id}] WARNING: ESRGAN batch {batch_idx+1} failed — "
-                      f"using originals. Error: {e}")
-                for f in batch:
-                    _shutil.copy2(f, enhanced_dir / f.name)
-            finally:
-                _shutil.rmtree(batch_in,  ignore_errors=True)
-                _shutil.rmtree(batch_out, ignore_errors=True)
-
-    finally:
-        _shutil.rmtree(tmp_root, ignore_errors=True)
-
-    enhanced_count = len(list(enhanced_dir.iterdir()))
-    if enhanced_count == 0:
-        print(f"[{job_id}] WARNING: ESRGAN produced no output — using originals")
-        return False
-
-    print(f"[{job_id}] Enhanced {enhanced_count}/{total} frames total")
-    return True
-
-
 def download_file(url: str, dest: Path) -> Path:
     resp = requests.get(url, stream=True, timeout=120)
     resp.raise_for_status()
@@ -487,32 +271,22 @@ def download_file(url: str, dest: Path) -> Path:
 
 
 def extract_frames(video_path: Path, output_dir: Path, job_id: str,
-                   fps: int = 3, max_frames: int = 120) -> Path:
+                   fps: int = 3, max_frames: int = 100) -> Path:
     output_dir.mkdir(exist_ok=True)
-
-    # Use scene_change detection + fixed fps together for better coverage.
-    # select filter: emit frame if it is a scene-change OR every N seconds.
-    # This ensures uniform coverage even in slow-panning room walkthroughs.
-    select_filter = (
-        f"select='isnan(prev_selected_t)+gte(t-prev_selected_t,1/{fps})',"
-        f"setpts=N/FRAME_RATE/TB"
-    )
     run_cmd([
         "ffmpeg", "-i", str(video_path),
-        "-vf", select_filter,
-        "-vsync", "vfr",
-        "-q:v", "1",          # highest JPEG quality — COLMAP needs clean textures
+        "-vf", f"fps={fps}",
+        "-q:v", "1",        # highest JPEG quality — no lossy compression artifacts
         str(output_dir / "%04d.jpg"),
         "-y",
     ], job_id)
 
     frames = sorted(output_dir.glob("*.jpg"))
     count  = len(frames)
-    print(f"[{job_id}] Extracted {count} frames at ~{fps} fps")
+    print(f"[{job_id}] Extracted {count} frames at {fps} fps")
 
-    # Uniform subsample if still over cap
     if count > max_frames:
-        keep = set(round(i * (count - 1) / (max_frames - 1)) for i in range(max_frames))
+        keep = set(round(i * (count-1) / (max_frames-1)) for i in range(max_frames))
         for i, f in enumerate(frames):
             if i not in keep:
                 f.unlink()
@@ -520,63 +294,53 @@ def extract_frames(video_path: Path, output_dir: Path, job_id: str,
 
     remaining = len(list(output_dir.glob("*.jpg")))
     if remaining < 20:
-        raise ValueError(f"Too few frames ({remaining}). Video may be too short or featureless.")
+        raise ValueError(f"Too few frames ({remaining}). Video may be too short.")
     return output_dir
 
 
-def run_colmap(images_dir: Path, colmap_dir: Path, job_id: str, is_video: bool = False):
+def run_colmap(images_dir: Path, colmap_dir: Path, job_id: str,
+               is_video: bool = False) -> Path:
     db     = colmap_dir / "database.db"
     sparse = colmap_dir / "sparse"
     sparse.mkdir(exist_ok=True)
     dense  = colmap_dir / "sparse_undistorted"
 
-    # COLMAP built with EGL — GPU SIFT works headless via EGL context.
-    # Fall back to CPU if CUDA unavailable (driver mismatch on some instances).
-    sift_use_gpu = "1" if _cuda_available() else "0"
-    _ensure_virtual_display()
+    sift_gpu = "1" if _cuda_available() else "0"
+
+    # ── Feature extraction ────────────────────────────────────────────────────
     run_cmd([
         "colmap", "feature_extractor",
-        "--database_path",                    str(db),
-        "--image_path",                       str(images_dir),
-        "--ImageReader.single_camera",        "1",
-        "--ImageReader.camera_model",         "OPENCV",
-        "--SiftExtraction.use_gpu",           sift_use_gpu,
-        "--SiftExtraction.max_num_features",  "16384",
-        "--SiftExtraction.peak_threshold",    "0.003",
-        "--SiftExtraction.edge_threshold",    "10",
-        "--SiftExtraction.num_octaves",       "4",
+        "--database_path",                   str(db),
+        "--image_path",                      str(images_dir),
+        "--ImageReader.single_camera",       "1",
+        "--ImageReader.camera_model",        "OPENCV",
+        "--SiftExtraction.use_gpu",          sift_gpu,
+        "--SiftExtraction.max_num_features", "16384",
+        "--SiftExtraction.peak_threshold",   "0.003",
+        "--SiftExtraction.edge_threshold",   "10",
+        "--SiftExtraction.num_octaves",      "4",
     ], job_id)
 
     # ── Feature matching ──────────────────────────────────────────────────────
-    # For video: sequential matcher with large overlap window + loop detection.
-    # For photos: exhaustive up to 120 images, vocab-tree beyond that.
-    # The original always used exhaustive — fine for small sets, but misses
-    # cross-room connections for video sequences.
-
-    image_count = len(list(images_dir.glob("*")))
-
-    # COLMAP is built with EGL enabled (see Dockerfile), so SiftGPU can create
-    # a GPU OpenGL context with no display server. GPU matching is safe to use.
-    match_use_gpu = "1" if _cuda_available() else "0"
-    print(f"[{job_id}] Feature matching — GPU={match_use_gpu}")
-
-    vocab_tree = Path("/colmap/vocab_tree_flickr100K_words256K.bin")
-    has_vocab  = vocab_tree.exists()
+    match_gpu  = "1" if _cuda_available() else "0"
+    has_vocab  = VOCAB_TREE.exists()
+    image_count = len(list(images_dir.glob("*.*")))
 
     if is_video:
         cmd = [
             "colmap", "sequential_matcher",
-            "--database_path",                          str(db),
-            "--SiftMatching.use_gpu",                   match_use_gpu,
-            "--SiftMatching.max_ratio",                 "0.85",
-            "--SiftMatching.max_num_matches",           "32768",
-            "--SequentialMatching.overlap",             "20",
-            "--SequentialMatching.loop_detection",      "1" if has_vocab else "0",
-            "--SequentialMatching.loop_detection_period","10",
-            "--SequentialMatching.loop_detection_num_images", "50",
+            "--database_path",                            str(db),
+            "--SiftMatching.use_gpu",                     match_gpu,
+            "--SiftMatching.max_ratio",                   "0.85",
+            "--SiftMatching.max_num_matches",             "32768",
+            "--SequentialMatching.overlap",               "30",   # was 20 — wider window survives fast panning
+            "--SequentialMatching.quadratic_overlap",     "1",    # also match at 2x,4x,8x gaps — bridges corners
+            "--SequentialMatching.loop_detection",        "1" if has_vocab else "0",
+            "--SequentialMatching.loop_detection_period", "5",    # was 10 — detect loops more frequently
+            "--SequentialMatching.loop_detection_num_images", "80",  # was 50 — wider loop search
         ]
         if has_vocab:
-            cmd += ["--SequentialMatching.vocab_tree_path", str(vocab_tree)]
+            cmd += ["--SequentialMatching.vocab_tree_path", str(VOCAB_TREE)]
         else:
             print(f"[{job_id}] WARNING: vocab tree missing — loop detection disabled")
         run_cmd(cmd, job_id)
@@ -584,54 +348,55 @@ def run_colmap(images_dir: Path, colmap_dir: Path, job_id: str, is_video: bool =
         run_cmd([
             "colmap", "exhaustive_matcher",
             "--database_path",        str(db),
-            "--SiftMatching.use_gpu", match_use_gpu,
+            "--SiftMatching.use_gpu", match_gpu,
             "--SiftMatching.max_ratio",       "0.85",
             "--SiftMatching.max_num_matches", "32768",
         ], job_id)
     else:
-        vocab_tree_path = Path("/colmap/vocab_tree_flickr100K_words256K.bin")
-        if not vocab_tree_path.exists():
+        if has_vocab:
             run_cmd([
-                "colmap", "exhaustive_matcher",
-                "--database_path",        str(db),
-                "--SiftMatching.use_gpu", match_use_gpu,
+                "colmap", "vocab_tree_matcher",
+                "--database_path",                         str(db),
+                "--SiftMatching.use_gpu",                  match_gpu,
+                "--VocabTreeMatching.vocab_tree_path",     str(VOCAB_TREE),
             ], job_id)
         else:
             run_cmd([
-                "colmap", "vocab_tree_matcher",
-                "--database_path",          str(db),
-                "--SiftMatching.use_gpu",   match_use_gpu,
-                "--VocabTreeMatching.vocab_tree_path", str(vocab_tree_path),
+                "colmap", "exhaustive_matcher",
+                "--database_path",        str(db),
+                "--SiftMatching.use_gpu", match_gpu,
             ], job_id)
 
     # ── Mapper ────────────────────────────────────────────────────────────────
     run_cmd([
         "colmap", "mapper",
-        "--database_path",                     str(db),
-        "--image_path",                        str(images_dir),
-        "--output_path",                       str(sparse),
-        # Allow more re-triangulation attempts for rooms where many points
-        # are initially missed on textureless walls/ceilings
+        "--database_path",                       str(db),
+        "--image_path",                          str(images_dir),
+        "--output_path",                         str(sparse),
         "--Mapper.ba_global_max_num_iterations", "50",
-        "--Mapper.tri_min_angle",              "2.0",  # lower than default — helps flat surfaces
+        "--Mapper.tri_min_angle",                "2.0",
     ], job_id)
 
     if not any(sparse.iterdir()):
         raise RuntimeError(
             "COLMAP reconstruction failed — no sparse model produced. "
-            "Ensure video covers all walls with slow, overlapping sweeps."
+            "Walk slowly with lots of overlap and good lighting."
         )
 
-    # If COLMAP produced multiple sub-models (fragmented reconstruction),
-    # merge them into model 0 so training uses the complete scene.
+    _log_colmap_stats(sparse, job_id)
+
+    # Merge fragmented sub-models if COLMAP produced more than one
     sub_models = sorted(sparse.iterdir())
     if len(sub_models) > 1:
-        print(f"[{job_id}] WARNING: COLMAP produced {len(sub_models)} sub-models — merging...")
-        _merge_colmap_models(sparse, sub_models, db, images_dir, job_id)
+        print(f"[{job_id}] WARNING: {len(sub_models)} sub-models — attempting merge...")
+        _merge_colmap_models(sparse, sub_models, job_id)
 
-    # ── Image undistortion ────────────────────────────────────────────────────
+    # ── Undistortion ──────────────────────────────────────────────────────────
+    # Always use sparse/0 — _merge_colmap_models renames the result to 0
     dense.mkdir(exist_ok=True)
-    model_dir = next(sparse.iterdir())
+    model_dir = sparse / "0"
+    if not model_dir.exists():
+        model_dir = next(iter(sorted(sparse.iterdir())))
     run_cmd([
         "colmap", "image_undistorter",
         "--image_path",  str(images_dir),
@@ -640,7 +405,7 @@ def run_colmap(images_dir: Path, colmap_dir: Path, job_id: str, is_video: bool =
         "--output_type", "COLMAP",
     ], job_id)
 
-    # Fix sparse subdir structure expected by train.py (sparse/0/cameras.bin)
+    # Fix sparse subdir structure: train.py expects sparse/0/cameras.bin
     undist_sparse = dense / "sparse"
     target_0      = undist_sparse / "0"
     if undist_sparse.exists() and not target_0.exists():
@@ -652,50 +417,24 @@ def run_colmap(images_dir: Path, colmap_dir: Path, job_id: str, is_video: bool =
     return dense
 
 
-def _merge_colmap_models(sparse_dir: Path, sub_models: list, db: Path,
-                         images_dir: Path, job_id: str):
-    """
-    Attempt to merge fragmented COLMAP sub-models using model_merger.
-    Falls back to keeping the largest sub-model if merging fails.
-    """
-    try:
-        merged_dir = sparse_dir / "merged"
-        merged_dir.mkdir(exist_ok=True)
-        run_cmd([
-            "colmap", "model_merger",
-            "--input_path1",  str(sub_models[0]),
-            "--input_path2",  str(sub_models[1]),
-            "--output_path",  str(merged_dir),
-        ], job_id)
-        # Re-register the merged model as model 0
-        target = sparse_dir / "0"
-        if target.exists():
-            shutil.rmtree(target)
-        merged_dir.rename(target)
-        print(f"[{job_id}] Models merged successfully")
-    except Exception as e:
-        print(f"[{job_id}] Model merge failed ({e}) — using largest sub-model")
-        # Pick sub-model with most images as the best reconstruction
-        largest = max(sub_models, key=lambda p: sum(1 for _ in p.glob("*.bin")))
-        target = sparse_dir / "0"
-        if largest != target:
-            if target.exists():
-                shutil.rmtree(target)
-            shutil.copytree(largest, target)
-
-
 def find_final_ply(output_dir: Path, job_id: str) -> Path:
     candidates = sorted(output_dir.glob("point_cloud/iteration_*/point_cloud.ply"))
     if not candidates:
         raise FileNotFoundError(f"No .ply output found in {output_dir}")
-    return candidates[-1]
+    ply = candidates[-1]
+    print(f"[{job_id}] Found .ply: {ply} ({ply.stat().st_size/1024/1024:.1f}MB)")
+    return ply
 
 
-def compress_ply(input_path: Path, output_path: Path, job_id: str, min_opacity: float = 0.004) -> Path:
+def compress_ply(input_path: Path, output_path: Path, job_id: str,
+                 min_opacity: float = 0.004,
+                 mobile_target: int = 800_000) -> Path:
     """
-    Prune floaters + quantize float32 → float16.
-    min_opacity comes from the quality profile so we don't over-prune
-    subtle geometry like curtains or thin furniture legs.
+    Mobile optimisation:
+      1. Opacity prune   — remove invisible floaters
+      2. Size prune      — remove oversized background blobs
+      3. Importance sort — keep highest quality Gaussians up to mobile_target
+      4. float16 quantise — halve non-position property size
     """
     try:
         import numpy as np
@@ -703,38 +442,61 @@ def compress_ply(input_path: Path, output_path: Path, job_id: str, min_opacity: 
 
         plydata = PlyData.read(str(input_path))
         vertex  = plydata["vertex"]
-        data    = {prop.name: vertex[prop.name] for prop in vertex.properties}
-        original_count = len(data[list(data.keys())[0]])
+        data    = {p.name: vertex[p.name] for p in vertex.properties}
+        n0      = len(data["x"])
+        print(f"[{job_id}] Mobile optimise: {n0:,} Gaussians input")
 
-        # logit(min_opacity) threshold — prune near-invisible Gaussians
-        import math
-        logit_thresh = math.log(min_opacity / (1 - min_opacity))
-
+        # Step 1: opacity prune
         if "opacity" in data:
-            mask = data["opacity"] > logit_thresh
-            kept = int(mask.sum())
-            print(f"[{job_id}] Pruning: {original_count} → {kept} Gaussians "
-                  f"({100*kept//original_count}% kept, threshold={min_opacity})")
-            data = {k: v[mask] for k, v in data.items()}
+            thresh = math.log(min_opacity / (1.0 - min_opacity))
+            mask   = data["opacity"] > thresh
+            data   = {k: v[mask] for k, v in data.items()}
+            print(f"[{job_id}]   After opacity prune: {len(data['x']):,}")
 
-        position_props = {"x", "y", "z"}
-        arrays = []
-        for name, arr in data.items():
-            if name not in position_props and arr.dtype == np.float32:
-                arr = arr.astype(np.float16)
-            arrays.append((name, arr))
+        # Step 2: size prune — remove top 5% largest Gaussians
+        scale_keys = sorted(k for k in data if k.startswith("scale_"))
+        if scale_keys:
+            scales    = np.stack([np.exp(data[k]) for k in scale_keys], axis=1)
+            max_scale = scales.max(axis=1)
+            thresh_sz = np.percentile(max_scale, 95)
+            mask      = max_scale < thresh_sz
+            data      = {k: v[mask] for k, v in data.items()}
+            print(f"[{job_id}]   After size prune:    {len(data['x']):,}")
 
-        dtype   = [(name, arr.dtype) for name, arr in arrays]
+        # Step 3: importance sort + cap
+        n_now = len(data["x"])
+        if n_now > mobile_target:
+            if "opacity" in data and scale_keys:
+                opacity_sig = 1.0 / (1.0 + np.exp(-data["opacity"]))
+                scales      = np.stack([np.exp(data[k]) for k in scale_keys], axis=1)
+                importance  = opacity_sig / (scales.max(axis=1) + 1e-6)
+            elif "opacity" in data:
+                importance  = 1.0 / (1.0 + np.exp(-data["opacity"]))
+            else:
+                importance  = np.ones(n_now)
+
+            top_idx = np.argpartition(importance, -mobile_target)[-mobile_target:]
+            top_idx = np.sort(top_idx)
+            data    = {k: v[top_idx] for k, v in data.items()}
+            print(f"[{job_id}]   After mobile cap:    {len(data['x']):,}")
+
+        # Step 4: float16 quantise (keep xyz as float32)
+        pos    = {"x", "y", "z"}
+        arrays = [
+            (n, a if n in pos else
+             (a.astype(np.float16) if a.dtype == np.float32 else a))
+            for n, a in data.items()
+        ]
         count   = len(arrays[0][1])
+        dtype   = [(n, a.dtype) for n, a in arrays]
         new_arr = np.zeros(count, dtype=dtype)
-        for name, arr in arrays:
-            new_arr[name] = arr
+        for n, a in arrays:
+            new_arr[n] = a
 
         PlyData([PlyElement.describe(new_arr, "vertex")], text=False).write(str(output_path))
-
         orig_mb = input_path.stat().st_size  / 1024 / 1024
         comp_mb = output_path.stat().st_size / 1024 / 1024
-        print(f"[{job_id}] Compressed: {orig_mb:.1f}MB → {comp_mb:.1f}MB")
+        print(f"[{job_id}] ✓ {orig_mb:.0f}MB → {comp_mb:.0f}MB | {count:,} Gaussians")
         return output_path
 
     except Exception as e:
@@ -754,22 +516,133 @@ def run_cmd(cmd: list, job_id: str = "") -> str:
     return result.stdout
 
 
+def _cuda_available() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def _log_colmap_stats(sparse_dir: Path, job_id: str):
+    try:
+        import struct
+        total_images = 0
+        total_points = 0
+        for model_dir in sorted(sparse_dir.iterdir()):
+            images_bin = model_dir / "images.bin"
+            points_bin = model_dir / "points3D.bin"
+            if images_bin.exists():
+                with open(images_bin, "rb") as f:
+                    total_images += struct.unpack("<Q", f.read(8))[0]
+            if points_bin.exists():
+                with open(points_bin, "rb") as f:
+                    total_points += struct.unpack("<Q", f.read(8))[0]
+        print(f"[{job_id}] COLMAP: {total_images} images registered, "
+              f"{total_points:,} 3D points")
+        if total_images < 50:
+            print(f"[{job_id}] ⚠ WARNING: only {total_images} images registered — "
+                  f"reconstruction will be partial. Re-shoot more slowly.")
+    except Exception as e:
+        print(f"[{job_id}] Could not read COLMAP stats: {e}")
+
+
+def _merge_colmap_models(sparse_dir: Path, sub_models: list, job_id: str):
+    try:
+        merged = sparse_dir / "merged"
+        merged.mkdir(exist_ok=True)
+        run_cmd([
+            "colmap", "model_merger",
+            "--input_path1", str(sub_models[0]),
+            "--input_path2", str(sub_models[1]),
+            "--output_path", str(merged),
+        ], job_id)
+        target = sparse_dir / "0"
+        if target.exists():
+            shutil.rmtree(target)
+        merged.rename(target)
+        print(f"[{job_id}] Models merged successfully")
+    except Exception as e:
+        print(f"[{job_id}] Merge failed ({e}) — using largest sub-model")
+        largest = max(sub_models, key=lambda p: sum(1 for _ in p.glob("*.bin")))
+        target  = sparse_dir / "0"
+        if largest != target:
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(largest, target)
+
+
+def _ensure_virtual_display():
+    if os.environ.get("DISPLAY"):
+        return
+    try:
+        import subprocess as sp
+        sp.Popen(["Xvfb", ":99", "-screen", "0", "1024x768x24"],
+                 stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+        os.environ["DISPLAY"] = ":99"
+        time.sleep(1)
+        print("[COLMAP] Started Xvfb on :99")
+    except FileNotFoundError:
+        pass
+
+
 def parse_error_code(message: str) -> str:
     msg = message.lower()
     if "colmap" in msg or "sfm" in msg:        return "COLMAP_FAILED"
     if "out of memory" in msg or "oom" in msg: return "GPU_OOM"
-    if "too few" in msg:                        return "TOO_FEW_IMAGES"
-    if "cuda" in msg:                           return "CUDA_ERROR"
+    if "too few" in msg:                       return "TOO_FEW_IMAGES"
+    if "cuda" in msg:                          return "CUDA_ERROR"
     return "WORKER_ERROR"
 
 def humanize_error(message: str) -> str:
     return {
-        "COLMAP_FAILED":  "Could not reconstruct 3D geometry. Walk slowly around the room with lots of overlap.",
-        "GPU_OOM":        "GPU ran out of memory. Try 'fast' quality or a shorter video.",
-        "TOO_FEW_IMAGES": "Not enough usable frames. Upload a longer video or more photos.",
+        "COLMAP_FAILED":  "Could not reconstruct 3D geometry. Walk slowly with lots of overlap.",
+        "GPU_OOM":        "GPU ran out of memory. Try 'balanced' quality.",
+        "TOO_FEW_IMAGES": "Not enough usable frames. Upload a longer video.",
         "CUDA_ERROR":     "A GPU error occurred. Please try again.",
         "WORKER_ERROR":   "Processing failed. Please try again.",
     }.get(parse_error_code(message), "Processing failed. Please try again.")
+
+
+def run_startup_diagnostics():
+    print("\n" + "="*50)
+    print("  STARTUP DIAGNOSTICS")
+    print("="*50)
+
+    for tool in ["colmap", "ffmpeg", "python3"]:
+        try:
+            subprocess.run([tool, "--help"], capture_output=True, timeout=10)
+            print(f"[DIAG] ✓ {tool} found")
+        except FileNotFoundError:
+            print(f"[DIAG] ✗ {tool} NOT FOUND — jobs will fail")
+        except Exception:
+            print(f"[DIAG] ✓ {tool} found")
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            vram  = props.total_memory / 1024**3
+            print(f"[DIAG] ✓ CUDA — {props.name} ({vram:.0f}GB VRAM)")
+            if vram < 20:
+                print(f"[DIAG] ⚠ <20GB VRAM — high quality may OOM")
+        else:
+            print("[DIAG] ✗ CUDA unavailable — training will fail")
+    except Exception as e:
+        print(f"[DIAG] ✗ torch: {e}")
+
+    train_py = GAUSSIAN_REPO / "train.py"
+    if train_py.exists():
+        print(f"[DIAG] ✓ gaussian-splatting train.py found")
+    else:
+        print(f"[DIAG] ✗ train.py NOT FOUND at {train_py}")
+
+    if VOCAB_TREE.exists():
+        print(f"[DIAG] ✓ Vocab tree ({VOCAB_TREE.stat().st_size//1024//1024}MB)")
+    else:
+        print(f"[DIAG] ⚠ Vocab tree missing — loop detection disabled")
+
+    print("="*50 + "\n")
 
 
 if __name__ == "__main__":

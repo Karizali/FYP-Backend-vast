@@ -42,7 +42,7 @@ const handleUpload = [
   assignJobId,
   
   // Multer streams files directly to B2 (no disk touch)
-  upload.array('files', 50),
+  upload.array('files', 300),
   checkQualitySetting,
 
   async (req, res, next) => {
