@@ -19,7 +19,7 @@ app.use(helmet());
 // }));
 
 app.use(cors({
-  origin: true, // or whitelist specific origins
+  origin: 'http://localhost:8080', // or whitelist specific origins
   credentials: true, // REQUIRED — without this cookies won't be sent
 }));
 
@@ -68,6 +68,7 @@ const uploadRoutes  = require('./routes/upload.routes');
 const jobRoutes     = require('./routes/job.routes');
 const webhookRoutes = require('./routes/webhook.routes');
 const storageRoutes = require('./routes/storage.routes');
+const splatRoutes = require('./routes/splat');
 const errorHandler  = require('./middleware/errorHandler');
 
 app.use('/api/auth',     authRoutes);
@@ -75,6 +76,7 @@ app.use('/api/upload',   uploadRoutes);
 app.use('/api/jobs',     jobCreationLimiter, jobRoutes);
 app.use('/api/webhooks', webhookRoutes);
 app.use('/api/storage',  storageRoutes);
+app.use('/api/splat-proxy',  splatRoutes);
 
 // ─── 404 Fallback ─────────────────────────────────────────────────────────────
 // Note: '/{*path}' required by path-to-regexp v8+ (used in Express 5 / Node 24)
