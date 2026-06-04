@@ -4,7 +4,7 @@ const { validationResult } = require('express-validator');
 const User = require('../models/User');
 const logger = require('../utils/logger');
 const Otp = require('../models/otp');
-const { sendOTPEmail, generateOTP } = require('../config/userEmailOTP');
+const { sendOTPEmail, generateOTP } = require('../config/userEmailOTP.js');
 
 // ─── Helper: sign a JWT ───────────────────────────────────────────────────────
 function signToken(userId) {
