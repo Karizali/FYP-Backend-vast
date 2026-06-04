@@ -1,7 +1,10 @@
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
 const { validationResult } = require('express-validator');
 const User = require('../models/User');
 const logger = require('../utils/logger');
+const Otp = require('../models/otp');
+const { sendOTPEmail, generateOTP } = require('../config/userEmailOTP');
 
 // ─── Helper: sign a JWT ───────────────────────────────────────────────────────
 function signToken(userId) {
@@ -83,7 +86,7 @@ async function login(req, res, next) {
     // Cookie options
     const cookieOptions = {
       httpOnly: true,
-      secure: true, // HTTPS in production
+      secure: true,
       sameSite: 'None',
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     };
@@ -96,7 +99,6 @@ async function login(req, res, next) {
       token,
       user: user.toPublic(),
     });
-
   } catch (error) {
     next(error);
   }
@@ -185,4 +187,126 @@ async function updateFcmToken(req, res, next) {
   }
 }
 
-module.exports = { register, login, getProfile, updateProfile, changePassword, updateFcmToken };
+// ─── POST /api/auth/forget-password ──────────────────────────────────────────
+// Step 1: Validate email, generate OTP, send to user's email
+async function forgetPassword(req, res, next) {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email is required.' });
+    }
+
+    const normalizedEmail = email.toLowerCase();
+
+    const user = await User.findOne({ email: normalizedEmail });
+    if (!user) {
+      return res.status(400).json({ success: false, message: 'No account found with this email.' });
+    }
+
+    const otp = generateOTP();
+    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    let otpHash;
+    try {
+      const salt = await bcrypt.genSalt();
+      otpHash = await bcrypt.hash(otp, salt);
+    } catch (error) {
+      logger.error('OTP hash error:', error);
+      return next(error);
+    }
+
+    await Otp.findOneAndUpdate(
+      { email: normalizedEmail },
+      { email: normalizedEmail, otp: otpHash, expiresAt: otpExpiry, createdAt: new Date() },
+      { upsert: true, new: true }
+    );
+
+    const emailSent = await sendOTPEmail(normalizedEmail, otp);
+    if (!emailSent) {
+      return res.status(500).json({ success: false, message: 'Failed to send OTP email. Please try again.' });
+    }
+
+    logger.info(`Forget-password OTP sent to ${normalizedEmail}`);
+
+    res.status(200).json({
+      success: true,
+      message: 'OTP sent to your email. It expires in 10 minutes.',
+      email: normalizedEmail,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+// ─── POST /api/auth/forget-password/verify ───────────────────────────────────
+// Step 2: Verify OTP and set new password
+async function forgetPasswordVerify(req, res, next) {
+  try {
+    const { email, otp, newPassword } = req.body;
+
+    if (!email || !otp || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'email, otp, and newPassword are required.',
+      });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: 'New password must be at least 8 characters.',
+      });
+    }
+
+    const normalizedEmail = email.toLowerCase();
+
+    const otpRecord = await Otp.findOne({ email: normalizedEmail });
+    if (!otpRecord) {
+      return res.status(400).json({ success: false, message: 'OTP not found or already expired.' });
+    }
+
+    if (new Date() > otpRecord.expiresAt) {
+      await Otp.deleteOne({ email: normalizedEmail });
+      return res.status(400).json({ success: false, message: 'OTP has expired. Please request a new one.' });
+    }
+
+    const isMatch = await bcrypt.compare(otp, otpRecord.otp);
+    if (!isMatch) {
+      return res.status(400).json({ success: false, message: 'Invalid OTP.' });
+    }
+
+    let passwordHash;
+    try {
+      const salt = await bcrypt.genSalt();
+      passwordHash = await bcrypt.hash(newPassword, salt);
+    } catch (error) {
+      logger.error('Password hash error:', error);
+      return next(error);
+    }
+
+    await User.updateOne(
+      { email: normalizedEmail },
+      { $set: { password: passwordHash } }
+    );
+
+    await Otp.deleteOne({ email: normalizedEmail });
+
+    logger.info(`Password reset successful for ${normalizedEmail}`);
+
+    res.status(200).json({ success: true, message: 'Password reset successfully.' });
+  } catch (error) {
+    next(error);
+  }
+}
+
+module.exports = {
+  register,
+  login,
+  getProfile,
+  updateProfile,
+  changePassword,
+  updateFcmToken,
+  forgetPassword,
+  forgetPasswordVerify,
+};

@@ -7,6 +7,8 @@ const {
   updateProfile,
   changePassword,
   updateFcmToken,
+  forgetPassword,
+  forgetPasswordVerify,
 } = require('../controllers/auth.controller');
 const { authenticate } = require('../middleware/auth');
 
@@ -86,5 +88,9 @@ router.put('/password', authenticate, changePasswordRules, changePassword);
  * Called by Flutter after login to register push notification token
  */
 router.put('/fcm-token', authenticate, updateFcmToken);
+
+
+router.post('/forget-password',         forgetPassword);
+router.post('/forget-password-otp-verify',  forgetPasswordVerify);
 
 module.exports = router;
