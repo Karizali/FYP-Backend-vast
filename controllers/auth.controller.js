@@ -223,8 +223,9 @@ async function forgetPassword(req, res, next) {
     );
 
     const emailSent = await sendOTPEmail(normalizedEmail, otp);
-    if (!emailSent) {
-      return res.status(500).json({ success: false, message: 'Failed to send OTP email. Please try again.' });
+    if (!emailSent.success) {
+      return res.status(500)
+      .json({ success: false, message: `Failed to send OTP email. Please try again.\n ${emailSent.message}` });
     }
 
     logger.info(`Forget-password OTP sent to ${normalizedEmail}`);
