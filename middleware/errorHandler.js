@@ -105,13 +105,7 @@ function errorHandler(err, req, res, next) { // eslint-disable-line no-unused-va
     });
   }
 
-  // ── Bull / Redis errors ──────────────────────────────────────────────────────
-  if (err.message?.includes('Redis') || err.message?.includes('ECONNREFUSED')) {
-    return res.status(503).json({
-      success: false,
-      message: 'Job queue temporarily unavailable. Please try again shortly.',
-    });
-  }
+
 
   // ── Our own AppError ─────────────────────────────────────────────────────────
   if (err.isOperational) {

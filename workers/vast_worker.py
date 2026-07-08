@@ -241,7 +241,7 @@ def process_job(job):
         api_patch_status(job_id, "converting", 95)
         thumbnail_info = None
         thumbnail_path = work / "thumbnail.jpg"
-        if render_thumbnail(output_dir, thumbnail_path, job_id):
+        if render_thumbnail(output_dir, thumbnail_path, job_id, frames_dir=images_dir):
             thumbnail_info = upload_thumbnail_to_b2(thumbnail_path, job_id)
 
         # ── Complete ───────────────────────────────────────────────────────
@@ -533,60 +533,68 @@ def compress_ply(input_path: Path, output_path: Path, job_id: str,
         return input_path
 
 
-def render_thumbnail(model_dir: Path, output_path: Path, job_id: str) -> Path:
+def render_thumbnail(model_dir: Path, output_path: Path, job_id: str, frames_dir: Path = None) -> Path:
     """
     Render a preview thumbnail from the trained Gaussian Splatting model.
-    Uses the render.py script from the gaussian-splatting repo.
+    Falls back to first input frame if rendering fails.
     """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # ── Try Method 1: Use gaussian-splatting render.py ─────────────────────
     try:
         render_py = GAUSSIAN_REPO / "render.py"
-        if not render_py.exists():
-            print(f"[{job_id}] render.py not found — skipping thumbnail")
-            return None
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Run render.py with specific parameters
-        # This renders a single viewpoint as JPEG for preview
-        run_cmd([
-            "python3", str(render_py),
-            "-m", str(model_dir),
-            "-o", str(output_path.parent),
-            "--quiet",
-        ], job_id)
-
-        # If render.py created a default output, use it
-        if output_path.exists():
-            print(f"[{job_id}] ✓ Thumbnail rendered ({output_path.stat().st_size/1024:.0f}KB)")
-            return output_path
-
-        # Otherwise look for any PNG/JPEG in the output directory
-        for ext in ["*.png", "*.jpg", "*.jpeg"]:
-            candidates = sorted(output_path.parent.glob(ext))
-            if candidates:
-                img_path = candidates[0]
-                # Convert PNG to JPEG if needed
-                if img_path.suffix.lower() == ".png":
-                    import subprocess as sp
-                    sp.run([
-                        "convert", str(img_path), 
-                        "-quality", "90",
-                        str(output_path)
-                    ], check=True)
-                    img_path.unlink()
-                    print(f"[{job_id}] ✓ Thumbnail rendered ({output_path.stat().st_size/1024:.0f}KB)")
-                    return output_path
-                else:
-                    img_path.rename(output_path)
-                    print(f"[{job_id}] ✓ Thumbnail rendered ({output_path.stat().st_size/1024:.0f}KB)")
-                    return output_path
-
-        print(f"[{job_id}] WARNING: render.py did not produce output")
-        return None
-
+        if render_py.exists():
+            print(f"[{job_id}] Rendering thumbnail from model...")
+            try:
+                run_cmd([
+                    "python3", str(render_py),
+                    "-m", str(model_dir),
+                    "-o", str(output_path.parent),
+                ], job_id)
+                
+                # Look for any output in the render directory
+                for ext in ["*.png", "*.jpg", "*.jpeg"]:
+                    candidates = sorted(output_path.parent.glob(ext))
+                    for img_path in candidates:
+                        # Convert to JPEG if needed
+                        if img_path.suffix.lower() == ".png":
+                            import subprocess as sp
+                            sp.run([
+                                "convert", str(img_path), 
+                                "-quality", "85", "-resize", "1024x1024",
+                                str(output_path)
+                            ], check=True, capture_output=True)
+                            img_path.unlink()
+                        else:
+                            img_path.rename(output_path)
+                        
+                        if output_path.exists():
+                            print(f"[{job_id}] ✓ Thumbnail rendered ({output_path.stat().st_size/1024:.0f}KB)")
+                            return output_path
+            except Exception as e:
+                print(f"[{job_id}] render.py failed: {e}")
     except Exception as e:
-        print(f"[{job_id}] Thumbnail rendering failed (non-fatal): {e}", file=sys.stderr)
-        return None
+        print(f"[{job_id}] render.py error: {e}")
+
+    # ── Fallback Method 2: Use first input frame ──────────────────────────
+    if frames_dir and frames_dir.exists():
+        try:
+            print(f"[{job_id}] Using first input frame as thumbnail...")
+            frames = sorted(frames_dir.glob("*.jpg")) or sorted(frames_dir.glob("*.png"))
+            if frames:
+                import subprocess as sp
+                sp.run([
+                    "convert", str(frames[0]), 
+                    "-quality", "85", "-resize", "1024x1024",
+                    str(output_path)
+                ], check=True, capture_output=True)
+                print(f"[{job_id}] ✓ Thumbnail created ({output_path.stat().st_size/1024:.0f}KB)")
+                return output_path
+        except Exception as e:
+            print(f"[{job_id}] Frame fallback failed: {e}")
+
+    print(f"[{job_id}] WARNING: Could not generate thumbnail")
+    return None
 
 
 def run_cmd(cmd: list, job_id: str = "") -> str:

@@ -1,7 +1,6 @@
 require('dotenv').config();
 const app                  = require('./app');
 const { connectDB }        = require('./config/database');
-const { connectRedis }     = require('./config/redis');
 const { verifyConnection } = require('./storage/b2Storage');
 const { startCleanupCron } = require('./storage/cleanupCron');
 const logger               = require('./utils/logger');
@@ -12,7 +11,6 @@ async function startServer() {
   try {
     // ── 1. Database connections ───────────────────────────────────────────────
     await connectDB();
-    await connectRedis();
 
     // ── 2. Verify Backblaze B2 (Layer 3) ──────────────────────────────────────
     // Non-fatal: logs a warning but doesn't crash — uploads will fail at runtime
