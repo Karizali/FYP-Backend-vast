@@ -104,6 +104,21 @@ def upload_to_b2(file_path: Path, job_id: str) -> dict:
     )
     return {"fileId": file_info.id_, "downloadUrl": bucket.get_download_url(file_name)}
 
+def upload_thumbnail_to_b2(file_path: Path, job_id: str) -> dict:
+    try:
+        bucket    = get_b2_bucket()
+        file_name = f"outputs/{job_id}/thumbnail.jpg"
+        print(f"[{job_id}] Uploading thumbnail ({file_path.stat().st_size/1024:.0f}KB)...")
+        file_info = bucket.upload_local_file(
+            local_file=str(file_path),
+            file_name=file_name,
+            content_type="image/jpeg",
+        )
+        return {"fileId": file_info.id_, "downloadUrl": bucket.get_download_url(file_name)}
+    except Exception as e:
+        print(f"[{job_id}] Thumbnail upload failed (non-fatal): {e}", file=sys.stderr)
+        return None
+
 # ─── API helpers ──────────────────────────────────────────────────────────────
 HEADERS = {"Content-Type": "application/json", "X-Worker-Secret": WORKER_SECRET}
 
@@ -222,12 +237,26 @@ def process_job(job):
         api_patch_status(job_id, "converting", 90)
         b2_result = upload_to_b2(ply_path, job_id)
 
-        api_patch_status(job_id, "done", 100, output={
+        # ── Stage 6: Render and upload thumbnail ────────────────────────────
+        api_patch_status(job_id, "converting", 95)
+        thumbnail_info = None
+        thumbnail_path = work / "thumbnail.jpg"
+        if render_thumbnail(output_dir, thumbnail_path, job_id):
+            thumbnail_info = upload_thumbnail_to_b2(thumbnail_path, job_id)
+
+        # ── Complete ───────────────────────────────────────────────────────
+        output_data = {
             "glbB2Id":        b2_result["fileId"],
             "glbDownloadUrl": b2_result["downloadUrl"],
             "fileSizeBytes":  ply_path.stat().st_size,
-        })
+        }
+        if thumbnail_info:
+            output_data["thumbnailB2Id"]       = thumbnail_info["fileId"]
+            output_data["thumbnailDownloadUrl"] = thumbnail_info["downloadUrl"]
+
+        api_patch_status(job_id, "done", 100, output=output_data)
         print(f"[{job_id}] ✓ Done → {b2_result['downloadUrl']}")
+
 
     except Exception as e:
         error_msg = str(e)
@@ -502,6 +531,62 @@ def compress_ply(input_path: Path, output_path: Path, job_id: str,
     except Exception as e:
         print(f"[{job_id}] Compression failed — using original: {e}")
         return input_path
+
+
+def render_thumbnail(model_dir: Path, output_path: Path, job_id: str) -> Path:
+    """
+    Render a preview thumbnail from the trained Gaussian Splatting model.
+    Uses the render.py script from the gaussian-splatting repo.
+    """
+    try:
+        render_py = GAUSSIAN_REPO / "render.py"
+        if not render_py.exists():
+            print(f"[{job_id}] render.py not found — skipping thumbnail")
+            return None
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Run render.py with specific parameters
+        # This renders a single viewpoint as JPEG for preview
+        run_cmd([
+            "python3", str(render_py),
+            "-m", str(model_dir),
+            "-o", str(output_path.parent),
+            "--quiet",
+        ], job_id)
+
+        # If render.py created a default output, use it
+        if output_path.exists():
+            print(f"[{job_id}] ✓ Thumbnail rendered ({output_path.stat().st_size/1024:.0f}KB)")
+            return output_path
+
+        # Otherwise look for any PNG/JPEG in the output directory
+        for ext in ["*.png", "*.jpg", "*.jpeg"]:
+            candidates = sorted(output_path.parent.glob(ext))
+            if candidates:
+                img_path = candidates[0]
+                # Convert PNG to JPEG if needed
+                if img_path.suffix.lower() == ".png":
+                    import subprocess as sp
+                    sp.run([
+                        "convert", str(img_path), 
+                        "-quality", "90",
+                        str(output_path)
+                    ], check=True)
+                    img_path.unlink()
+                    print(f"[{job_id}] ✓ Thumbnail rendered ({output_path.stat().st_size/1024:.0f}KB)")
+                    return output_path
+                else:
+                    img_path.rename(output_path)
+                    print(f"[{job_id}] ✓ Thumbnail rendered ({output_path.stat().st_size/1024:.0f}KB)")
+                    return output_path
+
+        print(f"[{job_id}] WARNING: render.py did not produce output")
+        return None
+
+    except Exception as e:
+        print(f"[{job_id}] Thumbnail rendering failed (non-fatal): {e}", file=sys.stderr)
+        return None
 
 
 def run_cmd(cmd: list, job_id: str = "") -> str:

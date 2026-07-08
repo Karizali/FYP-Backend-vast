@@ -2,7 +2,7 @@ const express = require('express');
 const { param, query } = require('express-validator');
 const { authenticate } = require('../middleware/auth');
 const {
-  listJobs, getJob, getJobResult, deleteJob,
+  getFeedJobs, listJobs, getJob, getJobResult, deleteJob,
   workerDequeue, workerUpdate,
 } = require('../controllers/job.controller');
 
@@ -18,6 +18,15 @@ const listQueryRules = [
   query('limit').optional().isInt({ min: 1, max: 50 }),
   query('status').optional().isIn(['queued','preprocessing','training','converting','done','failed']),
 ];
+
+const feedQueryRules = [
+  query('page').optional().isInt({ min: 1 }),
+  query('limit').optional().isInt({ min: 1, max: 50 }),
+  query('category').optional().isIn(['landscape', 'product', 'real-estate', 'architecture', 'other']),
+];
+
+// ─── Public unauthenticated routes ────────────────────────────────────────────
+router.get('/feed', feedQueryRules, getFeedJobs);
 
 // ─── Worker routes (no JWT — authenticated by X-Worker-Secret header) ─────────
 // Must be defined BEFORE router.use(authenticate) so they aren't JWT-blocked

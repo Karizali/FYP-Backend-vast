@@ -9,6 +9,54 @@ function verifyWorkerSecret(req) {
   return true;   // skip auth for testing
 }
 
+// ─── GET /api/jobs/feed ──────────────────────────────────────────────────────
+// Public unauthenticated route for browsing all public listings
+async function getFeedJobs(req, res, next) {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, parseInt(req.query.limit) || 10);
+    const skip = (page - 1) * limit;
+
+    const filter = { isPublic: true, status: 'done', deletedAt: null };
+    if (req.query.category) filter.category = req.query.category;
+
+    const [jobs, total] = await Promise.all([
+      Job.find(filter)
+        .populate('userId', 'username email')  // Get user details
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .select('-inputFiles.b2Id -inputFiles.downloadUrl -inputFiles.folder -output.glbB2Id -output.thumbnailB2Id'),
+      Job.countDocuments(filter),
+    ]);
+
+    res.json({
+      success: true,
+      data: jobs.map((j) => ({
+        id: j._id,
+        title: j.title,
+        description: j.description,
+        category: j.category,
+        propertyDetails: j.propertyDetails,
+        owner: {
+          userId: j.userId._id,
+          username: j.userId.username,
+        },
+        thumbnail: j.output?.thumbnailDownloadUrl,
+        fileSize: j.output?.fileSizeBytes,
+        quality: j.settings?.quality,
+        createdAt: j.createdAt,
+        durationSeconds: j.durationSeconds,
+      })),
+      pagination: {
+        page, limit, total,
+        pages: Math.ceil(total / limit),
+        hasNext: page * limit < total,
+      },
+    });
+  } catch (error) { next(error); }
+}
+
 // ─── GET /api/jobs ────────────────────────────────────────────────────────────
 async function listJobs(req, res, next) {
   try {
@@ -217,4 +265,4 @@ async function workerUpdate(req, res, next) {
   } catch (error) { next(error); }
 }
 
-module.exports = { listJobs, getJob, getJobResult, deleteJob, workerDequeue, workerUpdate };
+module.exports = { getFeedJobs, listJobs, getJob, getJobResult, deleteJob, workerDequeue, workerUpdate };

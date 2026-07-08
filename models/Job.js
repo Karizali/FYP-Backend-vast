@@ -100,6 +100,34 @@ const jobSchema = new mongoose.Schema(
       maxlength: [200, 'Title cannot exceed 200 characters'],
     },
 
+    // ─── Display Properties ───────────────────────────────────────────────
+    description: {
+      type:      String,
+      default:   '',
+      trim:      true,
+      maxlength: [1000, 'Description cannot exceed 1000 characters'],
+    },
+
+    category: {
+      type:      String,
+      enum:      ['landscape', 'product', 'real-estate', 'architecture', 'other'],
+      default:   'other',
+      trim:      true,
+    },
+
+    propertyDetails: {
+      width:  { type: Number, default: null },  // in meters or units
+      height: { type: Number, default: null },
+      depth:  { type: Number, default: null },
+      unit:   { type: String, default: 'meters' },  // measurement unit
+    },
+
+    isPublic: {
+      type:    Boolean,
+      default: true,    // true: visible in feed to all; false: only owner can see
+      index:   true,
+    },
+
     // ─── Status & Progress ─────────────────────────────────────────────────
     status: {
       type:    String,
