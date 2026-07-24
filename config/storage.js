@@ -196,7 +196,7 @@ const upload = multer({
   fileFilter,
   limits: {
     fileSize: 1000 * 1024 * 1024, // 1000 MB per file
-    files: 300,
+    files: 800,
   },
 });
 

@@ -10,7 +10,7 @@ const PLAN_LIMITS = {
   },
   pro: {
     jobsPerMonth: 100,
-    maxFilesPerJob: 300,
+    maxFilesPerJob: 800,
     maxQuality: 'high',
   },
 };
