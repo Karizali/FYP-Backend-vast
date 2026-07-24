@@ -9,10 +9,11 @@ const router = express.Router();
 
 // All storage routes require authentication
 // In production, add an isAdmin middleware here
-router.use(authenticate);
+// router.use(authenticate);
 
-router.get('/:jobId', authenticate, async (req, res) => {
+router.get('/:jobId', async (req, res) => {
   try {
+    console.log('Splat proxy request for jobId:', req.params.jobId);
     const jobId = req.params.jobId.replace(/_scene\.ply$/i, '').replace(/\.ply$/i, '');
 
     const job = await Job.findById(jobId);
@@ -21,9 +22,9 @@ router.get('/:jobId', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'Job not found' });
     }
 
-    if (job.userId.toString() !== req.user.id.toString()) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
+    // if (job.userId.toString() !== req.user.id.toString()) {
+    //   return res.status(403).json({ error: 'Forbidden' });
+    // }
 
     const fileUrl = `https://f005.backblazeb2.com/file/3d-guassian/outputs/${job._id}_scene.ply`;
     console.log('Fetching from B2:', fileUrl);
