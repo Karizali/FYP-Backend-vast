@@ -4,9 +4,15 @@ const { v4: uuidv4 } = require('uuid');
 const logger = require('../utils/logger');
 
 // ─── Configure Backblaze B2 ───────────────────────────────────────────────────
+// Added axios config for better timeout handling on batch uploads
 const b2 = new B2({
   applicationKeyId: process.env.B2_KEY_ID,
   applicationKey: process.env.B2_APP_KEY,
+  // Increase timeouts for large batch uploads (e.g., 627 images)
+  // The B2 SDK uses axios which respects these settings
+  axios: {
+    timeout: 60000, // 60s timeout per request (default is often 30s or none)
+  },
 });
 
 let _isAuthorized = false;
@@ -30,37 +36,60 @@ async function getBucket() {
 }
 
 // ─── Retry helper with exponential backoff ────────────────────────────────────
-async function retryWithBackoff(fn, retries = 4, baseDelayMs = 1000) {
+// Handles transient B2 errors, network failures, and temporary unavailability
+async function retryWithBackoff(fn, retries = 5, baseDelayMs = 1000) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       return await fn();
     } catch (err) {
       const status = err?.response?.status;
+      const errorCode = err?.code || err?.message;
+      
+      // Retryable: 5xx errors, rate limiting, connection issues, timeouts
       const isRetryable =
-        status === 503 ||
-        status === 500 ||
-        status === 429 ||
-        err?.code === 'ECONNRESET' ||
-        err?.code === 'ETIMEDOUT';
+        status === 503 ||  // Service Unavailable
+        status === 500 ||  // Internal Server Error
+        status === 502 ||  // Bad Gateway
+        status === 429 ||  // Too Many Requests
+        err?.code === 'ECONNRESET' ||    // Connection reset
+        err?.code === 'ETIMEDOUT' ||     // Timeout
+        err?.code === 'ECONNREFUSED' ||  // Connection refused (B2 temporarily down)
+        err?.code === 'EHOSTUNREACH' ||  // Host unreachable
+        err?.code === 'ENETUNREACH' ||   // Network unreachable
+        err?.code === 'ENOTFOUND' ||     // DNS lookup failed
+        errorCode?.includes('ECONNABORTED'); // Connection aborted
 
-      if (!isRetryable || attempt === retries) throw err;
+      if (!isRetryable || attempt === retries) {
+        const errMsg = `[${status || err?.code}] ${err?.message || 'Unknown error'}`;
+        logger.error(`B2 upload failed after ${attempt + 1} attempts: ${errMsg}`);
+        throw err;
+      }
 
-      const delay = baseDelayMs * Math.pow(2, attempt); // 1s, 2s, 4s, 8s
+      const delay = baseDelayMs * Math.pow(2, attempt); // 1s, 2s, 4s, 8s, 16s, 32s
       logger.warn(
-        `B2 upload attempt ${attempt + 1} failed (${status || err?.code}), retrying in ${delay}ms...`
+        `B2 upload attempt ${attempt + 1} failed (${status || err?.code}), ` +
+        `retrying in ${delay}ms... (${attempt}/${retries})`
       );
       await new Promise(res => setTimeout(res, delay));
 
       // Re-authorize on retry — B2 may have rotated tokens
       _isAuthorized = false;
-      await ensureAuthorized();
+      try {
+        await ensureAuthorized();
+      } catch (authErr) {
+        logger.error(`Re-authorization failed on retry ${attempt + 1}: ${authErr.message}`);
+        if (attempt === retries) throw authErr;
+        // Continue retry loop even if re-auth fails
+      }
     }
   }
 }
 
 // ─── Upload concurrency limiter ───────────────────────────────────────────────
 // Prevents hammering B2 with hundreds of simultaneous uploads
-const MAX_CONCURRENT_UPLOADS = 5;
+// For batch jobs (e.g., 627 images), this queue prevents overwhelming the server
+// Set to 10 for better throughput on large batch uploads while staying within B2 limits
+const MAX_CONCURRENT_UPLOADS = 10;
 let _activeUploads = 0;
 const _uploadQueue = [];
 
@@ -115,6 +144,9 @@ class B2Storage {
     }
 
     await acquireUploadSlot();
+    
+    const uploadStartTime = Date.now();
+    const fileSize = file.size || file.stream.bytesRead;
 
     try {
       await ensureAuthorized();
@@ -134,6 +166,11 @@ class B2Storage {
       }
 
       const fileName = `${folder}/${publicId}`;
+      
+      logger.info(
+        `Starting upload: ${file.originalname} (${(fileSize / 1024 / 1024).toFixed(2)}MB) ` +
+        `| Active: ${_activeUploads}/${MAX_CONCURRENT_UPLOADS} | Queued: ${_uploadQueue.length}`
+      );
 
       // Buffer the stream — must happen outside retry loop (stream is single-read)
       // For large video files consider disk-buffering instead, but for images this is fine
@@ -147,21 +184,41 @@ class B2Storage {
 
       // Retry getUploadUrl + uploadFile together — fresh URL fetched on each attempt
       const fileInfo = await retryWithBackoff(async () => {
-        const { data: uploadData } = await b2.getUploadUrl({ bucketId: process.env.B2_BUCKET_ID });
-        const { data } = await b2.uploadFile({
-          uploadUrl: uploadData.uploadUrl,
-          uploadAuthToken: uploadData.authorizationToken,
-          fileName,
-          data: fileData,
-          contentType,
-          info: {
-            originalName: file.originalname,
-            userId,
-            jobId,
-          },
-        });
-        return data;
+        try {
+          const { data: uploadData } = await b2.getUploadUrl({ 
+            bucketId: process.env.B2_BUCKET_ID,
+            // Add timeout for getUploadUrl request
+          });
+          
+          const { data } = await b2.uploadFile({
+            uploadUrl: uploadData.uploadUrl,
+            uploadAuthToken: uploadData.authorizationToken,
+            fileName,
+            data: fileData,
+            contentType,
+            info: {
+              originalName: file.originalname,
+              userId,
+              jobId,
+            },
+          });
+          return data;
+        } catch (uploadErr) {
+          logger.error(
+            `B2 upload error for file ${file.originalname} (${fileData.length} bytes): ` +
+            `${uploadErr.code || uploadErr.status} - ${uploadErr.message}`
+          );
+          throw uploadErr;
+        }
       });
+
+      const uploadDuration = Date.now() - uploadStartTime;
+      const uploadSpeed = (fileSize / 1024 / 1024 / (uploadDuration / 1000)).toFixed(2);
+      
+      logger.info(
+        `✓ Uploaded: ${file.originalname} | ID: ${fileInfo.fileId} | ` +
+        `${uploadDuration}ms (${uploadSpeed} MB/s)`
+      );
 
       const downloadUrl = `${_downloadUrl}/file/${process.env.B2_BUCKET_NAME}/${fileName}`;
 
@@ -177,6 +234,10 @@ class B2Storage {
         folder,
       });
     } catch (err) {
+      const uploadDuration = Date.now() - uploadStartTime;
+      logger.error(
+        `✗ Failed to upload ${file.originalname}: ${err.message} (${uploadDuration}ms)`
+      );
       cb(err);
     } finally {
       releaseUploadSlot();
